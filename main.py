@@ -277,6 +277,7 @@ def main():
     exper_num = get_experiment_num(today, args)
 
     with ExperimentLogger(today, exper_num, device, args) as logger:
+        print("Initializing")
         # 数据与模型
         full_dataset = load_dataset(args.dataset_name)
         model = load_model(args.model, num_classes=len(full_dataset.classes)).to(device)
@@ -310,6 +311,8 @@ def main():
                 args_async.k_push = args_async.num_conn
 
             coordinator = AsyncCoordinator(clients, model, device, join_time, args_async)
+            print("Completed initialization")
+            print("Start training")
             run_async(coordinator, args, today, exper_num)
 
         print("Done")

@@ -51,7 +51,7 @@ def parse_args():
     parser.add_argument('--mode', type=str, default='async', choices=['sync', 'async'],
                         help='Execution mode: synchronous (round-based) or asynchronous (event-driven).')
     parser.add_argument('--fl_method', type=str, default='dfedavg',
-                        choices=['dfedavg', 'dfedcad', 'dfedmtkd', 'dfedmtkdrl', 'dfedpgp', 'dfedsam', 'fedgo', 'qfedcg', 'retfhd', 'async_dfedavg', 'dfedmac'],
+                        choices=['dfedavg', 'dfedcad', 'dfedmtkd', 'dfedmtkdrl', 'dfedpgp', 'dfedsam', 'fedgo', 'qfedcg', 'retfhd', 'async_dfedavg', 'adfedmac'],
                         help='Decentralized FL method (local training + on-receive aggregation policy).')
 
     # ----- Dataset / model / optimizer -----
@@ -91,7 +91,7 @@ def parse_args():
     parser.add_argument('--k_push', type=int, default=None,
                         help='Max neighbors to push to at each completion event (<= num_conn). '
                              'If None, defaults to num_conn.')
-    parser.add_argument('--eval_interval', type=float, default=0.0,
+    parser.add_argument('--eval_interval', type=float, default=1.0,
                         help='Wall-clock interval for evaluation ticks. Set 0 to disable periodic evaluation.')
     parser.add_argument('--compute_time_mode', type=str, default='steps*t_step',
                         choices=['constant', 'steps*t_step'],

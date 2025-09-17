@@ -77,7 +77,7 @@ class Client(ABC):
         # 支持两种模式：'constant' 或 'steps*t_step'（默认）
         self.compute_time_mode: str = hyperparam.get('compute_time_mode', 'steps*t_step')
         self.compute_interval: float = float(hyperparam.get('compute_interval', 1.0))  # constant 模式使用
-        self.t_step: float = float(hyperparam.get('t_step', 0.01))  # 每步耗时，steps*t_step 模式使用
+        self.t_step: float = float(hyperparam.get('t_step', 0.1))  # 每步耗时，steps*t_step 模式使用
 
         # ======= 接收端策略（异步下的缓冲与即时融合）=======
         self.fuse_on_receive: bool = bool(hyperparam.get('fuse_on_receive', True))
