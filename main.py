@@ -285,8 +285,11 @@ def main():
             args.dataset_indexes_dir, args.dataset_name, args.split_method, args.alpha
         )
 
+        # 异步：Join 时间表（单位=时间），并关闭协调器内部评估
+        join_time = build_join_table(num_clients, args, logger)
+
         # 客户端
-        clients = create_client(num_clients, args, client_indices, full_dataset, device)
+        clients = create_client(num_clients, args, client_indices, full_dataset, join_time.keys(), device)
 
         if args.mode == "sync_fl":
             # 同步：沿用旧的延迟机制（按轮次）
@@ -298,8 +301,6 @@ def main():
             coordinator = Coordinator(clients, model, device, delay_rounds, args)
             run_sync(coordinator, args, today, exper_num)
         else:
-            # 异步：Join 时间表（单位=时间），并关闭协调器内部评估
-            join_time = build_join_table(num_clients, args, logger)
 
             # 创建一个 args 副本，把 eval_interval 置 0（防止协调器内部也评估）
             class _NS: pass

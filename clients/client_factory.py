@@ -64,7 +64,7 @@ def _pick_client_class(fl_type: str):
     raise NotImplementedError(f'Invalid Federated learning method name: {fl_type}')
 
 
-def create_client(num_client: int, args, dataset_index, full_dataset, device) -> List:
+def create_client(num_client: int, args, dataset_index, full_dataset, join_table, device) -> List:
     """
     Instantiate per-client objects according to fl_method and inject all needed hyperparams.
     This is used in BOTH sync_fl and async_fl modes.
@@ -73,7 +73,7 @@ def create_client(num_client: int, args, dataset_index, full_dataset, device) ->
     train_hyperparam = _base_hyperparams(args)
 
     # method-specific extras
-    if "dfedcad" in args.fl_method:
+    if "dfedcad" in args.fl_method or "adfedmac" in args.fl_method:
         train_hyperparam['lambda_kd'] = args.lambda_kd
         train_hyperparam['n_clusters'] = args.n_clusters
         train_hyperparam['lambda_alignment'] = args.lambda_alignment
@@ -99,7 +99,12 @@ def create_client(num_client: int, args, dataset_index, full_dataset, device) ->
         )
 
     clients_list = [None] * num_client
+
     for idx in range(num_client):
+        if idx in join_table:
+            train_hyperparam['is_delayed'] = True
+        else:
+            train_hyperparam['is_delayed'] = False
         clients_list[idx] = client_class(
             idx, dataset_index[idx], full_dataset, train_hyperparam, device
         )

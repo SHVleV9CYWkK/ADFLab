@@ -127,6 +127,8 @@ class DFedCADClient(Client):
         return average_weights
 
     def _compute_global_local_model_difference(self):
+        if self.global_model is None:
+            return
         global_dict = self.global_model.state_dict()
         local_dict = self.model.state_dict()
         difference_dict = {}

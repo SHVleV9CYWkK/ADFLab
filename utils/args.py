@@ -132,7 +132,7 @@ def parse_args():
     parser.add_argument('--base_decay_rate', type=float, default=0.5,
                         help='Local momentum decay base rate.')
     parser.add_argument('--lambda_kd', type=float, default=0.1, help='Distillation strength.')
-    parser.add_argument('--lambda_alignment', type=float, default=0.1, help='Alignment strength.')
+    parser.add_argument('--lambda_alignment', type=float, default=0.01, help='Alignment strength.')
     parser.add_argument('--lambda_feature_kd', type=float, default=0.1, help='Feature distillation strength.')
     parser.add_argument('--rho', type=float, default=0.05,
                         help='Sharpness-Aware Minimization (DFedSAM) radius.')
