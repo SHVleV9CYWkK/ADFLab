@@ -24,12 +24,14 @@ class AsyncDFedAvgClient(Client):
         if len(self.neighbor_model_weights) == 0:
             return  # 没有邻居更新就不动
 
+        neighbor_weights_state = [neighbor[0] for neighbor in self.neighbor_model_weights]
+
         # 取当前本地模型（作为被平均的第一项）
         current = {k: v.detach().clone().to(self.device) for k, v in self.model.state_dict().items()}
         count = 1 + len(self.neighbor_model_weights)
 
         # 累加邻居
-        for sd in self.neighbor_model_weights:
+        for sd in neighbor_weights_state:
             for k in current.keys():
                 current[k] += sd[k].to(self.device)
 

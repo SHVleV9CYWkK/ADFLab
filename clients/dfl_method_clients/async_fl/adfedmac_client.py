@@ -407,4 +407,5 @@ class ADFedMACClient(Client):
         else:
             clustered_state_dict, cents, labels = self.cluster_model
         meta = self._prepare_maturity_meta(cents, labels)
+
         return clustered_state_dict, cents, labels, meta

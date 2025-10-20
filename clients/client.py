@@ -159,26 +159,30 @@ class Client(ABC):
     # -----------------------------
     # 发送 / 接收（载荷规范）
     # -----------------------------
-    def send_model(self) -> Dict[str, Any]:
+    def send_model(self):
         """
         返回“可传输载荷”：CPU 上的 state_dict + 元信息（sender_id / version / sender_time / model_nbytes）。
         注意：bytes_sent/recv 的累计应由协调器按收件人数量统计，这里仅提供 model_nbytes 便于计费。
         """
         if self.model is None:
             raise RuntimeError("send_model() 之前必须先设置模型：set_init_model(model)")
-        state_cpu = {k: v.detach().clone().to('cpu') for k, v in self.model.state_dict().items()}
-        payload = {
-            "state": state_cpu,
-            "meta": {
+        state = {k: v.detach().clone() for k, v in self.model.state_dict().items()}
+        meta = {
                 "sender_id": self.id,
                 "version": self.local_version,
                 "sender_time": self.last_update_time,
-                "model_nbytes": self._model_num_bytes(),
-            }
+                "model_nbytes": self._model_num_bytes()
         }
-        return payload
+        return state, meta
 
-    def receive_neighbor_model(self, neighbor_model: Dict[str, Any] | Dict[str, torch.Tensor]):
+    def receive_neighbor_model(self, neighbor_model):
+        sender_id = neighbor_model[-1]["sender_id"]
+
+        for idx ,item in enumerate(self.neighbor_model_weights):
+            if item[-1]["sender_id"] == sender_id:
+                self.neighbor_model_weights.pop(idx)
+                break
+
         self.neighbor_model_weights.append(neighbor_model)
 
         # 控制缓冲大小
@@ -188,9 +192,7 @@ class Client(ABC):
                 # 丢弃最旧
                 self.neighbor_model_weights = self.neighbor_model_weights[overflow:]
 
-    # -----------------------------
-    # 评估与 LR 调度（沿用原实现）
-    # -----------------------------
+
     def evaluate_model(self) -> Dict[str, float]:
         if self.client_val_loader is None:
             raise RuntimeError("评估需要已初始化的验证 DataLoader：请先在 Join 时调用 init_client()。")
