@@ -1,7 +1,7 @@
 from clients.client import Client
 
 
-class AsyncDFedAvgClient(Client):
+class IndependentClient(Client):
     def __init__(self, client_id, dataset_index, full_dataset, hyperparam, device):
         super().__init__(client_id, dataset_index, full_dataset, hyperparam, device)
 
