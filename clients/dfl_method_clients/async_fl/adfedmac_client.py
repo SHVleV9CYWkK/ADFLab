@@ -129,9 +129,9 @@ class ADFedMACClient(Client):
 
     def _update_local_history(self, centroids: Dict[str, torch.Tensor], mask: Dict[str, torch.Tensor]):
         for layer, c in centroids.items():
-            self._local_hist[layer].append(c.detach().cpu())
+            self._local_hist[layer].append(c.detach())
         for layer, m in mask.items():
-            self._local_mask_hist[layer].append(m.detach().cpu())
+            self._local_mask_hist[layer].append(m.detach())
 
     def _cluster_and_prune_model_weights(self):
         clustered: Dict[str, torch.Tensor] = {}
@@ -165,38 +165,50 @@ class ADFedMACClient(Client):
         return clustered, cents, labels
 
     def _c_swag_precision(self, hist: deque) -> torch.Tensor:
+        last = hist[-1]
         if len(hist) < 2:
-            return hist[-1].new_ones(hist[-1].shape[0], 1)
-        stack = torch.stack(list(hist), dim=0)
-        var = torch.var(stack, dim=0, unbiased=False)
-        return 1.0 / (var + self.maturity_eps)
+            return last.new_ones(last.shape[0], 1)  # << 修复：不要返回 0
+
+        stack = torch.stack(list(hist), dim=0)  # [T,K,1]
+        mu = stack.mean(dim=0)  # [K,1]
+        var = ((stack - mu) ** 2).mean(dim=0)  # [K,1]
+
+        # 相对方差（对尺度鲁棒）
+        cv = var / (mu.abs() + 1e-4)  # [K,1]
+        tau = getattr(self, "maturity_tau", 10.0)  # 超参：越大越挑剔
+        lam = torch.exp(-tau * cv).clamp_min(self.maturity_eps)  # (eps,1]
+        return lam
 
     def _stability_scores(self, layer_key: str,
                           cents_now: torch.Tensor,
                           labels_now: torch.Tensor,
                           mask_now: torch.Tensor) -> torch.Tensor:
         dev = cents_now.device
+        # 漂移：和上一帧质心差
         if len(self._local_hist[layer_key]) >= 1:
             prev_c = self._local_hist[layer_key][-1].to(dev)
-            drift = torch.abs(cents_now - prev_c)
+            drift = torch.abs(cents_now - prev_c)  # [K,1]
         else:
             drift = torch.zeros_like(cents_now)
 
-        # flat_w = self.model.state_dict()[layer_key].to(dev).view(-1, 1).detach()
-        # K = cents_now.shape[0]
-        # invar = self._cluster_intra_var(flat_w, labels_now, K, eps=self.maturity_eps)
+        # 簇内方差（当前帧；若担心开销，可对 flat_w 子采样）
+        flat_w = self.model.state_dict()[layer_key].to(dev).view(-1, 1).detach()
+        K = cents_now.shape[0]
+        invar = self._cluster_intra_var(flat_w, labels_now, K, eps=self.maturity_eps)  # [K,1]
 
+        # mask 翻转率（层级标量）
         if len(self._local_mask_hist[layer_key]) >= 1:
             prev_m = self._local_mask_hist[layer_key][-1].to(dev)
-            flips = (prev_m ^ mask_now).float().mean()
+            flips = (prev_m ^ mask_now).float().mean()  # scalar
         else:
             flips = torch.tensor(0.0, device=dev)
 
-        #  y_{i} = e^{x_{i}}
-        # stab = torch.exp(- self.beta_drift * drift - self.beta_invar * invar - self.beta_mask * flips)
-        stab = torch.exp(- self.beta_drift * drift  - self.beta_mask * flips)
-
-        return stab.clamp_min(1e-6)
+        stab = torch.exp(
+            - self.beta_drift * drift
+            - self.beta_invar * invar
+            - self.beta_mask * flips
+        )
+        return stab
 
     def _local_maturity(self, layer_key: str,
                         cents_now: torch.Tensor,
@@ -208,18 +220,18 @@ class ADFedMACClient(Client):
 
     def _prepare_maturity_meta(self, cents: Dict[str, torch.Tensor],
                                labels: Dict[str, torch.Tensor]) -> Dict[str, Any]:
-        layer_maturity = {}
-        for layer_key, c_now in cents.items():
-            m_now = self.mask[layer_key].to(c_now.device)
-            l_now = labels[layer_key]
-            maturity_vec = self._local_maturity(layer_key, c_now, l_now, m_now)
-            layer_maturity[layer_key] = float(maturity_vec.mean().item())
+        # layer_maturity = {}
+        # for layer_key, c_now in cents.items():
+        #     m_now = self.mask[layer_key].to(c_now.device)
+        #     l_now = labels[layer_key]
+        #     maturity_vec = self._local_maturity(layer_key, c_now, l_now, m_now)
+        #     layer_maturity[layer_key] = float(maturity_vec.mean().item())
         return {
             'version_meta': 'dfedmac_meta_v1',
             'sender_id': self.id,
             'version': int(self.local_version),
             'sender_time': float(self.last_update_time),
-            'layer_maturity': layer_maturity
+            # 'layer_maturity': layer_maturity
         }
 
     def _all_teacher_info(self) -> None:
@@ -280,42 +292,73 @@ class ADFedMACClient(Client):
             })
 
     def _compute_alignment_loss(self) -> torch.Tensor:
-        if len(self.teacher_info_list) == 0 or len(self.dkm_layers) == 0 or self.lambda_alignment == 0.0:
+        # if len(self.teacher_info_list) == 0 or len(self.dkm_layers) == 0 or self.lambda_alignment == 0.0:
+        #     return torch.zeros((), device=self.device)
+        #
+        # losses = []
+        # st = self.model.state_dict()
+        # for lk, dkm in self.dkm_layers.items():
+        #     Wf = st[lk].to(self.device).view(-1, 1)
+        #     t_cents = torch.stack([t['centroids'][lk].to(self.device)
+        #                            for t in self.teacher_info_list], dim=0)
+        #     maturity = torch.tensor([t['layer_maturity'].get(lk, 0.0)
+        #                              for t in self.teacher_info_list],
+        #                             device=self.device, dtype=torch.float)
+        #     alpha_base = torch.tensor([t['alpha'] for t in self.teacher_info_list],
+        #                               device=self.device, dtype=torch.float)
+        #     alpha_base = alpha_base / (alpha_base.sum() + 1e-12)
+        #
+        #     alpha_eff_raw = alpha_base * (maturity ** self.teacher_gamma)
+        #     alpha_eff = (alpha_eff_raw / alpha_eff_raw.sum()
+        #                  if alpha_eff_raw.sum() > 1e-12
+        #                  else torch.ones_like(alpha_eff_raw) / max(1, alpha_eff_raw.numel()))
+        #
+        #     alpha_eff = (1.0 - self.teacher_blend) * alpha_base + self.teacher_blend * alpha_eff
+        #     alpha_eff = alpha_eff / (alpha_eff.sum() + 1e-12)
+        #
+        #     X_rec, _, _ = dkm(
+        #         Wf,
+        #         teacher_centroids=t_cents,
+        #         teacher_alphas=alpha_eff,
+        #         teacher_index_tables=None,
+        #         lambda_teacher=1.0
+        #     )
+        #     losses.append(F.mse_loss(Wf, X_rec))
+        #
+        # return torch.stack(losses).sum() if losses else torch.zeros((), device=self.device)
+
+        if len(self.teacher_info_list) == 0:
             return torch.zeros((), device=self.device)
 
         losses = []
-        st = self.model.state_dict()
-        for lk, dkm in self.dkm_layers.items():
-            Wf = st[lk].to(self.device).view(-1, 1)
-            t_cents = torch.stack([t['centroids'][lk].to(self.device)
-                                   for t in self.teacher_info_list], dim=0)
-            maturity = torch.tensor([t['layer_maturity'].get(lk, 0.0)
-                                     for t in self.teacher_info_list],
-                                    device=self.device, dtype=torch.float)
-            alpha_base = torch.tensor([t['alpha'] for t in self.teacher_info_list],
-                                      device=self.device, dtype=torch.float)
-            alpha_base = alpha_base / (alpha_base.sum() + 1e-12)
+        # 多教师质心 & labels 都在 self.teacher_info_list
+        for layer_key, dkm in self.dkm_layers.items():
+            # 1) 拿学生当前权重
+            W = self.model.state_dict()[layer_key].to(self.device)  # Tensor
+            Wf = W.view(-1, 1)  # (N_w,1)
 
-            alpha_eff_raw = alpha_base * (maturity ** self.teacher_gamma)
-            alpha_eff = (alpha_eff_raw / alpha_eff_raw.sum()
-                         if alpha_eff_raw.sum() > 1e-12
-                         else torch.ones_like(alpha_eff_raw) / max(1, alpha_eff_raw.numel()))
+            # 2) 准备教师输入
+            teacher_centroids = torch.stack(
+                [t["centroids"][layer_key].to(self.device)
+                 for t in self.teacher_info_list], dim=0  # (T,K,1)
+            )
+            teacher_alphas = torch.tensor([t["alpha"] for t in self.teacher_info_list], device=self.device)  # (T,)
 
-            alpha_eff = (1.0 - self.teacher_blend) * alpha_base + self.teacher_blend * alpha_eff
-            alpha_eff = alpha_eff / (alpha_eff.sum() + 1e-12)
-
+            # 3) 调用 DKM 层，得到重构
             X_rec, _, _ = dkm(
                 Wf,
-                teacher_centroids=t_cents,
-                teacher_alphas=alpha_eff,
-                teacher_index_tables=None,
-                lambda_teacher=1.0
+                teacher_centroids=teacher_centroids,
+                teacher_alphas=teacher_alphas,
+                teacher_index_tables=None
             )
+
+            # 4) 重构误差
             losses.append(F.mse_loss(Wf, X_rec))
 
-        return torch.stack(losses).sum() if losses else torch.zeros((), device=self.device)
-
-
+        if losses:
+            return torch.stack(losses).sum()
+        else:
+            return torch.zeros((), device=self.device)
 
     def _local_train(self, is_lambda=False):
         if self.client_train_loader is None:
@@ -374,7 +417,6 @@ class ADFedMACClient(Client):
             # 延迟：完成一个 burst 计数
             if in_warmup:
                 self._warmup_done += 1
-
             return
         else:
             if len(self.dkm_layers) == 0:
