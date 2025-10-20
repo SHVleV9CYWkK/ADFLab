@@ -62,7 +62,6 @@ class AsyncCoordinator:
         self.num_conn = int(getattr(args, "num_conn", 2))
         self.symmetry = int(getattr(args, "symmetry", 1))
         self.gossip = int(getattr(args, "gossip", 0))  # 保留兼容，未使用
-        self.connected_graph: Optional[List[List[int]]] = None  # 0/1 邻接矩阵
 
         # 推送与评估
         self.k_push = int(getattr(args, "k_push", self.num_conn))
@@ -82,20 +81,9 @@ class AsyncCoordinator:
         self._seq_counter: int = 0
         self.now: float = 0.0
 
-        # 初始化：生成一次覆盖图，调度 JOIN / TRAIN_DONE / EVAL_TICK
-        self._generate_connected_graph_once()
+        # 初始化：调度 JOIN / TRAIN_DONE / EVAL_TICK
         self._bootstrap_events()
 
-    # ----------------------------------------------------------------------
-    # 覆盖图生成（一次性；无 Rewire）
-    # ----------------------------------------------------------------------
-    def _generate_connected_graph_once(self):
-        self.connected_graph = generate_overlay(
-            num_clients=self.num_clients,
-            num_conn=self.num_conn,
-            symmetry=self.symmetry,
-            seed=self.seed,
-        )
     # ----------------------------------------------------------------------
     # 初始化事件：按 join_time 投递 JOIN / TRAIN_DONE；投 EVAL_TICK
     # ----------------------------------------------------------------------
@@ -176,26 +164,15 @@ class AsyncCoordinator:
         """
         client = self.all_clients[cid]
 
+        buf = getattr(client, "neighbor_model_weights", None)
+        if buf is not None and len(buf) > 0:
+            client.aggregate()
+
         # 1) 本地训练（子类可在 train() 内调用 _local_train()）
         client.train()
 
         # 2) 更新异步元信息
         client.on_train_done(self.now)
-
-        # 3) 若本地有尚未融合的缓冲（在 fuse_on_receive=False 的情况下），先聚合一次，避免把“更生”的模型外发
-        try:
-            buf = getattr(client, "neighbor_model_weights", None)
-            fuse_on_receive = bool(getattr(client, "fuse_on_receive", True))
-            if buf is not None and len(buf) > 0 and not fuse_on_receive:
-                client.aggregate()
-                # 主动清空（子类也可选择在 aggregate 内清空；这里双保险）
-                try:
-                    client.neighbor_model_weights.clear()
-                except Exception:
-                    pass
-        except Exception:
-            # 即使聚合失败也不阻塞发送；但建议确保子类实现健壮
-            pass
 
         # 4) 在线过滤 + 少推：选择目标邻居
         receivers = self._sample_online_neighbors(cid, self.k_push)
@@ -243,22 +220,16 @@ class AsyncCoordinator:
         """
         在“出邻居 ∩ 已上线”中均匀无放回采样至多 k 个；候选不足则全部返回；没有候选则空。
         """
-        assert self.connected_graph is not None
-        candidates = []
-        row = self.connected_graph[cid]
-        for j in range(self.num_clients):
-            if j == cid:
-                continue
-            if row[j] and self.online[j]:
-                candidates.append(j)
-
-        if len(candidates) <= 0:
+        # 在线候选（全连通，不看 connected_graph）
+        candidates = [j for j in range(self.num_clients) if j != cid and self.online[j]]
+        n = len(candidates)
+        if n == 0:
             return []
-        if len(candidates) <= k:
+        if k >= n:
             # 少推：不补位
-            return candidates.copy()
+            return candidates[:]  # 返回一个副本
+        # 使用事先构造好的可复现实验用 RNG，例如 self._rng = random.Random(self.seed)
         return self._rng.sample(candidates, k)
-
     # ----------------------------------------------------------------------
     # 事件工具
     # ----------------------------------------------------------------------

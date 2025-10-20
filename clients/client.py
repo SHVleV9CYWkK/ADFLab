@@ -20,7 +20,6 @@ class Client(ABC):
         client.train() -> client.on_train_done(now)
         payload = client.send_model()  # CPU state + meta
         协调器按“在线过滤 + 少推”把 payload 发给若干邻居，邻居执行 receive_neighbor_model(payload)
-    - 若 fuse_on_receive=True，则接收即融合；否则缓冲到 neighbor_model_weights，等待子类在合适时机调用 aggregate()
 
     子类需要实现：
         - train(self)
@@ -80,7 +79,6 @@ class Client(ABC):
         self.t_step: float = float(hyperparam.get('t_step', 0.1))  # 每步耗时，steps*t_step 模式使用
 
         # ======= 接收端策略（异步下的缓冲与即时融合）=======
-        self.fuse_on_receive: bool = bool(hyperparam.get('fuse_on_receive', True))
         self.buffer_limit: int = int(hyperparam.get('buffer_limit', 10))
         self.neighbor_model_weights: list[Dict[str, torch.Tensor]] = []
 
@@ -181,25 +179,7 @@ class Client(ABC):
         return payload
 
     def receive_neighbor_model(self, neighbor_model: Dict[str, Any] | Dict[str, torch.Tensor]):
-        """
-        接收邻居的模型载荷。兼容两类输入：
-          - {'state': state_dict_on_cpu, 'meta': {...}}
-          - 直接的 state_dict_on_cpu（向后兼容旧调用）
-        策略：
-          - 若 fuse_on_receive=True：收到即融合（调用子类实现的 aggregate()），并清空缓冲。
-          - 否则：入缓冲；若超过 buffer_limit，丢弃最旧项。
-        """
-        # 提取 state_dict（CPU）
-        if isinstance(neighbor_model, dict) and "state" in neighbor_model:
-            state_dict = neighbor_model["state"]
-        else:
-            state_dict = neighbor_model  # 兼容旧调用：直接就是 state_dict
-
-        # 基本防御
-        if not isinstance(state_dict, dict):
-            raise ValueError("receive_neighbor_model() 期望收到 state_dict 或 {'state': state_dict, ...}。")
-
-        self.neighbor_model_weights.append(state_dict)
+        self.neighbor_model_weights.append(neighbor_model)
 
         # 控制缓冲大小
         if self.buffer_limit is not None and self.buffer_limit > 0:
@@ -207,13 +187,6 @@ class Client(ABC):
             if overflow > 0:
                 # 丢弃最旧
                 self.neighbor_model_weights = self.neighbor_model_weights[overflow:]
-
-        # 收到即融合（推荐默认）
-        if self.fuse_on_receive:
-            # 由子类在 aggregate() 内部将 neighbor_model_weights 聚合到 self.model
-            self.aggregate()
-            # 清空缓冲
-            self.neighbor_model_weights.clear()
 
     # -----------------------------
     # 评估与 LR 调度（沿用原实现）

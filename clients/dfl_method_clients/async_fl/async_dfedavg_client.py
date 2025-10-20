@@ -38,8 +38,6 @@ class AsyncDFedAvgClient(Client):
             current[k] /= float(count)
 
         self.model.load_state_dict(current)
-        # 清空缓冲（调用方通常也会清空；这里双保险）
-        self.neighbor_model_weights.clear()
 
     # ---- 初始化模型 ----
     def set_init_model(self, model):
