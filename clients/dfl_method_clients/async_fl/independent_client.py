@@ -18,3 +18,6 @@ class IndependentClient(Client):
 
     def send_model(self) -> Dict:
         return {}
+
+    def receive_neighbor_model(self, neighbor_model):
+        pass
