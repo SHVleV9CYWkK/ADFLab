@@ -138,7 +138,7 @@ def parse_args():
                         help='Sharpness-Aware Minimization (DFedSAM) radius.')
 
     # ----- Infra / logging -----
-    parser.add_argument('--n_job', type=int, default=1,
+    parser.add_argument('--n_job', type=int, default=-1,
                         help='(Sync server) number of parallel training processes.')
     parser.add_argument('--seed', type=int, default=42, help='Random seed.')
     parser.add_argument('--log_dir', type=str, default='logs', help='Log directory.')

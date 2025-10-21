@@ -311,7 +311,8 @@ def main():
             if args_async.k_push is None:
                 args_async.k_push = args_async.num_conn
 
-            coordinator = AsyncCoordinator(clients, model, device, join_time, args_async)
+            coordinator = AsyncCoordinator(clients, model, device, join_time, args_async, max_workers=args.n_job)
+            run_sync(coordinator, args, today, exper_num)
             print("Completed initialization")
             print("Start training")
             run_async(coordinator, args, today, exper_num)

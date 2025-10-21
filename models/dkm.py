@@ -31,120 +31,112 @@ class MultiTeacherDKMLayer(nn.Module):
         self.C = None
 
     def forward(
-        self,
-        X: torch.Tensor,                  # (N, D)
-        *,
-        teacher_centroids: torch.Tensor | None = None,   # (T, K, D)
-        teacher_alphas: torch.Tensor | None = None,      # (T,)
-        teacher_index_tables: list[torch.Tensor] | None = None,  # len T, (N_t,)
-        lambda_teacher: float = 1.0,
+            self,
+            X: torch.Tensor,  # (N, D)
+            *,
+            teacher_centroids: torch.Tensor | None = None,  # (T, K, D)
+            teacher_alphas: torch.Tensor | None = None,  # (T,)
+            teacher_index_tables: list[torch.Tensor] | None = None,  # 兼容参数（此实现使用基于 X 的 soft 语义）
+            lambda_teacher: float = 1.0,
     ):
         """
         返回:
-            X_rec : (N,D)   重构特征
-            C     : (K,D)   学生质心
-            A     : (N,K)   soft assignment
+            X_rec : (N, D)  # 与输入 X 同一坐标系（若内部做了中心化，这里已加回均值）
+            C_out : (K, D)  # 学生质心，亦在输入坐标系
+            A     : (N, K)  # 学生软分配
         """
-        X = X - X.mean(dim=0)                       # 中心化
         device = X.device
+        N, D = X.shape
 
-        # 初始化质心 (k-means++)
-        if self.C is None:
-            C = self._kpp_init(X)                       # (K,D)
-        else:
-            C = self.C
+        # ---- 统一坐标系：是否中心化（默认 True，可在 __init__ 里设置 self.centering） ----
+        mu = X.mean(dim=0, keepdim=True)  # (1, D)
+        Xc = X - mu  # 在中心化空间里聚类
 
-        # 教师相关预处理
-        use_teacher = teacher_centroids is not None and lambda_teacher > 0.0
+        # ---- 质心初始化（在当前坐标系） ----
+        Cc = self._kpp_init(Xc) if self.C is None else self.C  # (K, D)
+
+        # ---- 教师准备（平移到同坐标；alphas 归一化） ----
+        use_teacher = (teacher_centroids is not None) and (lambda_teacher > 0.0)
         if use_teacher:
-            T = teacher_centroids.size(0)
-            teacher_centroids = teacher_centroids.to(device)
-            if teacher_alphas is None:
-                teacher_alphas = torch.ones(T, device=device) / T
-            else:
-                teacher_alphas = teacher_alphas.to(device)
+            Tc = teacher_centroids.to(device)  # (T, K, D)
+            Tc = Tc - (mu if mu is not None else 0.0)  # 保证与 Xc 同坐标
+            T = Tc.size(0)
 
-            if teacher_index_tables is not None:
-                # one-hot -> (T, K, N_t)
-                teacher_oh = [
-                    F.one_hot(lbl.to(device), num_classes=self.K).float().t()
-                    for lbl in teacher_index_tables
-                ]
+            if teacher_alphas is None:
+                alphas = torch.full((T,), 1.0 / T, device=device)
+            else:
+                alphas = teacher_alphas.to(device)
+                alphas = alphas / (alphas.sum() + 1e-8)
+
+            # 说明：本实现对“语义相似”统一采用基于 X 的 soft 方式（teacher_index_tables 保留但不使用），
+            # 可避免不同数据集 N_t != N 的维度不一致问题。
         else:
             lambda_teacher = 0.0
+            T = 0
+            alphas = None
+            Tc = None
 
-        # E/M 迭代
+        # ---- E/M 迭代 ----
         for _ in range(self.T_max):
-            # E-step 估计隐变量（软分配概率）
-            dist2 = torch.cdist(X, C, p=2).pow(2)          # (N,K)
-            A = F.softmax(-dist2 / self.tau, dim=1)        # (N,K)
+            # E-step：学生软分配（自适应温度，防止饱和）
+            dist2 = torch.cdist(Xc, Cc, p=2).pow(2)  # (N, K)
+            tau_eff = self.tau if (getattr(self, "tau", 0.0) and self.tau > 0) else 1.0
+            scale_s = dist2.median().detach() + 1e-8  # 距离尺度自适应
+            logits = - dist2 / (scale_s * tau_eff)
+            A = torch.softmax(logits, dim=1)  # (N, K)
 
-            # 教师软对齐
+            # 教师软对齐：语义×数值混合得到映射权重 w，并汇总教师拉动项
             if use_teacher:
-                if teacher_index_tables is None:
-                    # teacher_soft[t] : (N,K)
-                    teacher_soft = []
-                    for t in range(T):
-                        dist_xc = torch.cdist(X, teacher_centroids[t], p=2)  # (N,K)
-                        prob = torch.softmax(-self.beta_sem * dist_xc, dim=1)
-                        teacher_soft.append(prob)
+                # (1) 语义相似：在同一 X 上评估 teacher soft assignment（自适应温度）
+                teacher_soft = []
+                for t in range(T):
+                    dist_xt = torch.cdist(Xc, Tc[t], p=2)  # (N, K)
+                    scale_t = dist_xt.median().detach() + 1e-8
+                    prob_t = torch.softmax(- self.beta_sem * dist_xt / scale_t, dim=1)
+                    teacher_soft.append(prob_t)  # (N, K)
 
-                    # 计算 soft-Jaccard
-                    jac_list = []
-                    for t in range(T):
-                        inter = teacher_soft[t].T @ A  # (K,K)
-                        union = (
-                                teacher_soft[t].sum(0, keepdim=True).T +
-                                A.sum(0, keepdim=True) - inter + 1e-8
-                        )
-                        jac_list.append(inter / union)
-                    J = torch.stack(jac_list, 0)  # (T,K,K)
-                else:
-                    # 1) Jaccard 语义相似  (T,K,K)
-                    #   先取学生硬标签以加速；对梯度影响可忽略
-                    stu_labels = A.argmax(dim=1)                       # (N,)
-                    stu_oh = F.one_hot(stu_labels, num_classes=self.K).float().t()  # (K,N)
+                # soft-Jaccard：每个老师与学生在 K×K 的“簇-簇重叠”
+                jac_list = []
+                for t in range(T):
+                    inter = teacher_soft[t].T @ A  # (K, K)
+                    union = teacher_soft[t].sum(0, keepdim=True).T + A.sum(0, keepdim=True) - inter + 1e-8
+                    jac_list.append(inter / union)
+                J = torch.stack(jac_list, dim=0)  # (T, K, K)
 
-                    jac_list = []
-                    for t in range(T):
-                        inter = teacher_oh[t] @ stu_oh.t()             # (K,K)
-                        union = (
-                            teacher_oh[t].sum(dim=1, keepdim=True)
-                            + stu_oh.sum(dim=1, keepdim=True) - inter + 1e-8
-                        )
-                        jac_list.append(inter / union)
-                    J = torch.stack(jac_list, dim=0)                   # (T,K,K)
+                # (2) 数值相似：教师质心 ↔ 学生质心（自适应缩放）
+                dist_c = torch.cdist(Tc, Cc, p=2)  # (T, K, K)
+                scale_c = dist_c.median().detach() + 1e-8
+                S = torch.exp(- self.beta_dist * dist_c / scale_c)  # (T, K, K)
 
-                # 2) 数值距离相似 S
-                dist_c = torch.cdist(teacher_centroids, C, p=2)        # (T,K,K)
-                S = torch.exp(-self.beta_dist * dist_c)
+                # (3) 语义×数值幂次混合，并沿 j 维（学生簇）行归一化得到映射 w_{t,i->j}
+                M = (J + 1e-8).pow(self.alpha_mix) * (S + 1e-8).pow(1.0 - self.alpha_mix)  # (T, K, K)
+                w = M / (M.sum(dim=2, keepdim=True) + 1e-8)  # (T, K, K)
 
-                # 3) 混合权重 M -> w 行归一化 幂次混合
-                # 只有教师质心都很契合学生时，才给予学生大的引导权重
-                M = (J + 1e-8).pow(self.alpha_mix) * \
-                    (S + 1e-8).pow(1.0 - self.alpha_mix)
-                w = M / (M.sum(dim=2, keepdim=True) + 1e-8)            # (T,K,K) 行归一化，得到对齐权重
-
-                # 4) teacher_matched_j  = Σ_{t,i} α_t * w_{t,i,j} * C^{t}_i
-                teacher_matched = torch.einsum(
-                    't, tik, t i d -> k d', teacher_alphas, w, teacher_centroids
-                )                                                      # (K,D)
+                # (4) 教师拉动：teacher_matched[j, d] = Σ_t α_t Σ_i w[t, i, j] * Tc[t, i, d]
+                teacher_matched = torch.einsum('t,tik,tid->kd', alphas, w, Tc)  # (K, D)
             else:
                 teacher_matched = 0.0
 
-            # M-step
-            num_stu = A.sum(dim=0, keepdim=True).t()                   # (K,1)
-            C_new = (A.t() @ X + lambda_teacher * teacher_matched) / (num_stu + lambda_teacher + 1e-8)
+            # M-step：带教师先验的质心更新
+            num_stu = A.sum(dim=0, keepdim=True).t()  # (K, 1)
+            Cc_new = (A.t() @ Xc + lambda_teacher * teacher_matched) / (num_stu + lambda_teacher + 1e-8)  # (K, D)
 
-            if torch.norm(C_new - C) < self.eps:
-                C = C_new
+            # 收敛判定：相对范数，避免尺度问题
+            num = torch.norm(Cc_new - Cc)
+            den = torch.norm(Cc) + 1e-8
+            if (num / den) < self.eps:
+                Cc = Cc_new
                 break
-            C = C_new
+            Cc = Cc_new
 
-        # 重构
-        X_rec = A @ C                                                 # (N,D)
-        self.C = C
-        return X_rec, C, A
+        # ---- 重构并还原到原坐标系（若中心化） ----
+        Xc_rec = A @ Cc
+        X_rec = Xc_rec + mu  # (N, D)
+        C_out = Cc + mu  # (K, D)
+
+        # 内部缓存质心（保留当前内部坐标版本；若想对外一致，也可改存 C_out）
+        self.C = Cc
+        return X_rec, C_out, A
 
     def _kpp_init(self, X):
         """k-means++ 初始化, 返回 (K,D)"""

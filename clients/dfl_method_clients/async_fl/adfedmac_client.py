@@ -70,8 +70,6 @@ class ADFedMACClient(Client):
 
         super().__init__(client_id, dataset_index, full_dataset, hp, device)
 
-        # --- 运行期容器 ---
-
         # 用于“对齐”的邻居缓存（存 3/4 元组：(clustered_state, centroids, labels [,meta])），仅延迟-对齐使用
         self.neighbor_model_weights: List[Any] = []
 
@@ -235,7 +233,7 @@ class ADFedMACClient(Client):
         }
 
     def _all_teacher_info(self) -> None:
-        if self.cluster_model is None:
+        if self.cluster_model is None or self.lambda_alignment == 0.0:
             return
         else:
             local_cents = self.cluster_model[1]
@@ -374,7 +372,7 @@ class ADFedMACClient(Client):
                 loss_sup = self.criterion(outputs, labels).mean()
 
                 loss_align = 0.0
-                if is_lambda:
+                if is_lambda and not self.lambda_alignment == 0.0:
                     loss_align = self._compute_alignment_loss()
 
                 loss = loss_sup + self.lambda_alignment * loss_align
@@ -417,7 +415,6 @@ class ADFedMACClient(Client):
             # 延迟：完成一个 burst 计数
             if in_warmup:
                 self._warmup_done += 1
-            return
         else:
             if len(self.dkm_layers) == 0:
                 self._register_dkm_layers()
@@ -425,17 +422,10 @@ class ADFedMACClient(Client):
             self._all_teacher_info()
             self._local_train(is_lambda=True)
 
-        # 训练后：更新结构化表示
         self.cluster_model = self._cluster_and_prune_model_weights()
 
     def set_init_model(self, model: torch.nn.Module):
-        """
-        与 AsyncDFedAvgClient 对齐：JOIN 当刻若聚合缓冲已有邻居模型，可先平均一次再开始训练。
-        """
         self.model = deepcopy(model).to(self.device)
-        self.cluster_model = None
-        self.teacher_info_list.clear()
-        self.mask.clear()
         self._warmup_done = 0
 
     def send_model(self):
