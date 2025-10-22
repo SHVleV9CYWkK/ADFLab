@@ -60,6 +60,7 @@ class ADFedMACClient(Client):
         # 对齐相关（仅延迟客户端在预训练后启用）
         self.lambda_alignment: float = float(hp.get('lambda_alignment', 0.01))
         self.n_clusters: int = int(hp.get('n_clusters', 16))
+        self.base_decay_rate = hyperparam.get('base_decay_rate', 0.5)
         self.teacher_gamma: float = float(hp.get('teacher_gamma', 1.0))
         self.teacher_blend: float = float(hp.get('teacher_blend', 0.6))
         self.maturity_window: int = int(hp.get('maturity_window', 5))
@@ -85,8 +86,21 @@ class ADFedMACClient(Client):
             Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor], Dict[str, torch.Tensor]]
         ] = None
 
+        self.global_model = None
+
+    def _compute_global_local_model_difference(self):
+        global_dict = self.global_model.state_dict()
+        local_dict = self.model.state_dict()
+        difference_dict = {}
+        for key in global_dict:
+            difference_dict[key] = local_dict[key] - global_dict[key]
+        return difference_dict
+
     # ===================== DKM/聚类/成熟度（与前版一致，略微精简） =====================
-    def _register_dkm_layers(self) -> None:
+    def _register_dkm_layers(self):
+        if self.lambda_alignment == 0.0:
+            return
+
         self.dkm_layers = {}
         for key in self.model.state_dict().keys():
             if 'weight' in key and 'bn' not in key and 'downsample' not in key and 'conv' in key:
@@ -165,7 +179,7 @@ class ADFedMACClient(Client):
     def _c_swag_precision(self, hist: deque) -> torch.Tensor:
         last = hist[-1]
         if len(hist) < 2:
-            return last.new_ones(last.shape[0], 1)  # << 修复：不要返回 0
+            return last.new_ones(last.shape[0], 1)
 
         stack = torch.stack(list(hist), dim=0)  # [T,K,1]
         mu = stack.mean(dim=0)  # [K,1]
@@ -266,27 +280,27 @@ class ADFedMACClient(Client):
 
         layer_keys = list(local_cents.keys())
         T = len(t_cents_list)
-        maturity_mat = torch.ones(len(layer_keys), T, dtype=torch.float, device=self.device)
-        for t_idx, meta in enumerate(t_meta_list):
-            if isinstance(meta, dict) and ('layer_maturity' in meta):
-                lm = meta['layer_maturity']
-                for li, lk in enumerate(layer_keys):
-                    if lk in lm:
-                        maturity_mat[li, t_idx] = max(float(lm[lk]), self.maturity_eps)
-
-        vmin = maturity_mat.min(dim=1, keepdim=True).values
-        vmax = maturity_mat.max(dim=1, keepdim=True).values
-        maturity_norm = torch.clamp((maturity_mat - vmin) / (vmax - vmin + 1e-8),
-                                    self.maturity_eps, 1.0)
+        # maturity_mat = torch.ones(len(layer_keys), T, dtype=torch.float, device=self.device)
+        # for t_idx, meta in enumerate(t_meta_list):
+        #     if isinstance(meta, dict) and ('layer_maturity' in meta):
+        #         lm = meta['layer_maturity']
+        #         for li, lk in enumerate(layer_keys):
+        #             if lk in lm:
+        #                 maturity_mat[li, t_idx] = max(float(lm[lk]), self.maturity_eps)
+        #
+        # vmin = maturity_mat.min(dim=1, keepdim=True).values
+        # vmax = maturity_mat.max(dim=1, keepdim=True).values
+        # maturity_norm = torch.clamp((maturity_mat - vmin) / (vmax - vmin + 1e-8),
+        #                             self.maturity_eps, 1.0)
 
         self.teacher_info_list = []
         for t in range(T):
-            layer_maturity_dict = {layer_keys[li]: float(maturity_norm[li, t].item())
-                                   for li in range(len(layer_keys))}
+            # layer_maturity_dict = {layer_keys[li]: float(maturity_norm[li, t].item())
+            #                        for li in range(len(layer_keys))}
             self.teacher_info_list.append({
                 'centroids': t_cents_list[t],
                 'alpha': float(alpha_base[t].item()),
-                'layer_maturity': layer_maturity_dict
+                # 'layer_maturity': layer_maturity_dict
             })
 
     def _compute_alignment_loss(self) -> torch.Tensor:
@@ -325,15 +339,15 @@ class ADFedMACClient(Client):
         #
         # return torch.stack(losses).sum() if losses else torch.zeros((), device=self.device)
 
-        if len(self.teacher_info_list) == 0:
+        if len(self.teacher_info_list) == 0 or self.lambda_alignment == 0.0:
             return torch.zeros((), device=self.device)
 
         losses = []
         # 多教师质心 & labels 都在 self.teacher_info_list
         for layer_key, dkm in self.dkm_layers.items():
             # 1) 拿学生当前权重
-            W = self.model.state_dict()[layer_key].to(self.device)  # Tensor
-            Wf = W.view(-1, 1)  # (N_w,1)
+            param = dict(self.model.named_parameters())[layer_key]
+            Wf = param.view(-1, 1)  # (N_w,1)
 
             # 2) 准备教师输入
             teacher_centroids = torch.stack(
@@ -351,7 +365,8 @@ class ADFedMACClient(Client):
             )
 
             # 4) 重构误差
-            losses.append(F.mse_loss(Wf, X_rec))
+            Wc = Wf - Wf.mean(dim=0, keepdim=True)
+            losses.append(F.mse_loss(Wc, X_rec, reduction="mean") / (Wf.var() + 1e-8))
 
         if losses:
             return torch.stack(losses).sum()
@@ -362,21 +377,40 @@ class ADFedMACClient(Client):
         if self.client_train_loader is None:
             raise RuntimeError("DataLoader not initialized; ensure init_client() on join.")
 
+        ref_momentum = self._compute_global_local_model_difference()
+
         self.model.train()
+
+        exponential_average_loss = None
+        alpha = 0.5
+
         for _ in range(self.epochs):
-            for x, labels in self.client_train_loader:
+            for batch_idx, (x, labels) in enumerate(self.client_train_loader):
                 self.model.load_state_dict(self._prune_model_weights())
                 x, labels = x.to(self.device), labels.to(self.device)
                 self.optimizer.zero_grad(set_to_none=True)
                 outputs = self.model(x)
                 loss_sup = self.criterion(outputs, labels).mean()
 
-                loss_align = 0.0
-                if is_lambda and not self.lambda_alignment == 0.0:
-                    loss_align = self._compute_alignment_loss()
+                loss_align = self._compute_alignment_loss()
 
-                loss = loss_sup + self.lambda_alignment * loss_align
-                loss.backward()
+                loss_final = loss_sup + self.lambda_alignment * loss_align
+                loss_final.backward()
+
+                if exponential_average_loss is None:
+                    exponential_average_loss = loss_final.item()
+                else:
+                    exponential_average_loss = alpha * loss_final.item() + (1 - alpha) * exponential_average_loss
+
+                if loss_final.item() < exponential_average_loss:
+                    decay_factor = min(self.base_decay_rate ** (batch_idx + 1) * 1.1, 0.8)
+                else:
+                    decay_factor = max(self.base_decay_rate ** (batch_idx + 1) / 1.1, 0.1)
+
+                for name, param in self.model.named_parameters():
+                    if name in ref_momentum:
+                        param.grad += decay_factor * ref_momentum[name]
+
                 self.optimizer.step()
 
     @torch.no_grad()
@@ -385,20 +419,13 @@ class ADFedMACClient(Client):
         if len(neighbor_weights_state) == 0:
             return  # 没有邻居更新就不动
 
-        # 取当前本地模型（作为被平均的第一项）
-        current = {k: v.detach().clone().to(self.device) for k, v in self.model.state_dict().items()}
-        count = 1 + len(neighbor_weights_state)
+        average_weights = {}
+        for key in neighbor_weights_state[0].keys():
+            weighted_sum = sum(
+                neighbor_weights_state[i][key].to(self.device) for i in range(len(neighbor_weights_state)))
+            average_weights[key] = weighted_sum / len(neighbor_weights_state)
 
-        # 累加邻居
-        for sd in neighbor_weights_state:
-            for k in current.keys():
-                current[k] += sd[k].to(self.device)
-
-        # 做平均并加载回模型
-        for k in current.keys():
-            current[k] /= float(count)
-
-        self.model.load_state_dict(current)
+        self.global_model.load_state_dict(average_weights)
 
     def train(self):
         """
@@ -427,6 +454,7 @@ class ADFedMACClient(Client):
 
     def set_init_model(self, model: torch.nn.Module):
         self.model = deepcopy(model).to(self.device)
+        self.global_model = deepcopy(model)
         self._warmup_done = 0
 
     def send_model(self):

@@ -53,7 +53,13 @@ class MultiTeacherDKMLayer(nn.Module):
         Xc = X - mu  # 在中心化空间里聚类
 
         # ---- 质心初始化（在当前坐标系） ----
-        Cc = self._kpp_init(Xc) if self.C is None else self.C  # (K, D)
+        with torch.no_grad():  # 初始化/取旧值不需要梯度
+            if self.C is None:
+                C0 = self._kpp_init(X)  # k++ 初始化
+            else:
+                C0 = self.C
+
+        Cc = C0.detach().clone()  # 确保是 leaf，无历史图
 
         # ---- 教师准备（平移到同坐标；alphas 归一化） ----
         use_teacher = (teacher_centroids is not None) and (lambda_teacher > 0.0)
@@ -135,18 +141,19 @@ class MultiTeacherDKMLayer(nn.Module):
         C_out = Cc + mu  # (K, D)
 
         # 内部缓存质心（保留当前内部坐标版本；若想对外一致，也可改存 C_out）
-        self.C = Cc
+        self.C = Cc.detach()
         return X_rec, C_out, A
 
     def _kpp_init(self, X):
         """k-means++ 初始化, 返回 (K,D)"""
-        N, _ = X.shape
-        device = X.device
-        idx = torch.randint(0, N, (1,), device=device)
-        C = [X[idx].squeeze(0)]
-        for _ in range(1, self.K):
-            D2 = torch.cdist(X, torch.stack(C), p=2).pow(2).min(dim=1)[0]
-            probs = D2 / (D2.sum() + 1e-8)
-            nxt = torch.multinomial(probs, 1)
-            C.append(X[nxt].squeeze(0))
-        return torch.stack(C)
+        with torch.no_grad():
+            N, _ = X.shape
+            device = X.device
+            idx = torch.randint(0, N, (1,), device=device)
+            C = [X[idx].squeeze(0)]
+            for _ in range(1, self.K):
+                D2 = torch.cdist(X, torch.stack(C), p=2).pow(2).min(dim=1)[0]
+                probs = D2 / (D2.sum() + 1e-8)
+                nxt = torch.multinomial(probs, 1)
+                C.append(X[nxt].squeeze(0))
+            return torch.stack(C)

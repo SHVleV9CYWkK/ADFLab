@@ -152,7 +152,7 @@ class AsyncCoordinator:
             self.all_clients[cid].init_client()
 
         # 无预热：直接排程首个 TRAIN_DONE
-        dur = float(self.all_clients[cid].compute_time_for_next_burst()) * 0.5
+        dur = float(self.all_clients[cid].compute_time_for_next_burst())
         self._push_event(at_time + dur, "TRAIN_DONE", cid, self.epoch[cid])
 
     def _handle_train_done(self, cid: int):
@@ -180,7 +180,7 @@ class AsyncCoordinator:
             self.all_clients[r].receive_neighbor_model(payload)
 
         # 6) 排程下一次 TRAIN_DONE
-        dur = float(client.compute_time_for_next_burst()) * 0.5
+        dur = float(client.compute_time_for_next_burst())
         self._push_event(self.now + dur, "TRAIN_DONE", cid, self.epoch[cid])
 
     def _handle_eval_tick(self):
