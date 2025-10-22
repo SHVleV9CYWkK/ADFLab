@@ -1,10 +1,10 @@
-# main.py
 import json
 import os
 import random
 import time
 from datetime import datetime
-from multiprocessing import Queue, Process
+# 导入 torch.multiprocessing
+import torch.multiprocessing as mp
 from typing import Dict
 
 import numpy as np
@@ -16,9 +16,9 @@ from tqdm import tqdm
 logging.getLogger().setLevel(logging.ERROR)
 
 from clients.client_factory import create_client
-from coordinator import Coordinator                  # 同步基线
-from async_coordinator import AsyncCoordinator       # 异步新协调器
-from evaluator import Evaluator                      # 统一评估
+from coordinator import Coordinator  # 同步基线
+from async_coordinator import AsyncCoordinator  # 异步新协调器
+from evaluator import Evaluator  # 统一评估
 from utils.args import parse_args
 from utils.experiment_logger import ExperimentLogger
 from utils.utils import (
@@ -28,9 +28,9 @@ from utils.utils import (
 
 
 # --------------------------
-# 日志工作进程（与旧版兼容）
+# 日志工作进程（不变）
 # --------------------------
-def log_worker(queue: Queue):
+def log_worker(queue: mp.Queue):
     while True:
         item = queue.get()
         if item == "STOP":
@@ -44,14 +44,11 @@ def log_worker(queue: Queue):
 
 
 # --------------------------
-# Join 时间表构建
+# Join 时间表构建（不变）
 # --------------------------
 def build_join_table(num_clients: int, args, logger) -> Dict[int, float]:
     """
     返回 {client_id: join_time_float}。
-    优先级：
-      1) --join_table 指定 JSON：{ "<id>": <time>, ... }；
-      2) 回退到 get_client_delay_info（把“延迟轮次”直接当作时间）。
     """
     if getattr(args, "join_table", None):
         path = args.join_table
@@ -78,11 +75,11 @@ def build_join_table(num_clients: int, args, logger) -> Dict[int, float]:
 
 
 # --------------------------
-# 同步执行（轮次驱动）
+# 同步执行（不变）
 # --------------------------
 def run_sync(coordinator: Coordinator, args, today_date, exper_num):
-    log_queue = Queue()
-    log_process = Process(target=log_worker, args=(log_queue,))
+    log_queue = mp.Queue()
+    log_process = mp.Process(target=log_worker, args=(log_queue,))
     log_process.start()
 
     evaluator = Evaluator(include_micro=True, include_quantiles=True)
@@ -99,7 +96,7 @@ def run_sync(coordinator: Coordinator, args, today_date, exper_num):
         coordinator.train_client(r)
         interchange(r)
 
-        # 统一口径评估：同步下，当前参与训练的客户端即“在线集合”
+        # 统一口径评估
         overall_results, client_results = evaluator.evaluate_online(
             coordinator.participated_training_clients,
             [True] * len(coordinator.participated_training_clients)
@@ -127,128 +124,11 @@ def run_sync(coordinator: Coordinator, args, today_date, exper_num):
 
 
 # --------------------------
-# 异步执行（事件驱动 + 时间对齐评估）
+# 异步执行 (!!! 已移除 !!!)
 # --------------------------
-def run_async(coordinator: AsyncCoordinator, args, today_date, exper_num):
-    evaluator = Evaluator(include_micro=True, include_quantiles=True)
+# `run_async` 函数已被移除。
+# 协调器现在通过 eval_interval 自动处理评估和日志记录。
 
-    eval_interval = float(getattr(args, "eval_interval", 0.0))
-    # 优先 total_time，其次 n_rounds
-    total_time = float(args.total_time) if getattr(args, "total_time", None) is not None \
-                 else float(getattr(args, "n_rounds", 50))
-
-    if total_time <= 0:
-        raise ValueError("total_time must be > 0 (or set n_rounds > 0).")
-    if eval_interval < 0:
-        eval_interval = 0.0
-    if eval_interval > 0 and eval_interval > total_time:
-        print(f"[Warn] eval_interval ({eval_interval}) > total_time ({total_time}); "
-              f"will evaluate only once at the end.")
-        eval_interval = 0.0
-
-    log_queue = Queue()
-    log_process = Process(target=log_worker, args=(log_queue,))
-    log_process.start()
-
-    # 进度条：以“墙钟时间”为单位
-    pbar = tqdm(total=total_time, desc="Async time", unit="t")
-
-    next_eval_time = eval_interval if eval_interval > 0 else total_time
-    tick = 0
-    last_eval_now = coordinator.now
-
-    # 性能跟踪（时间加权平均）
-    last_overall = {}
-    best_acc = -1.0
-    best_time = 0.0
-    acc_dt = []   # [(acc, dt), ...] 用于时间加权平均
-    online_hist = []  # 在线客户端数的平均参考
-
-    while coordinator.now < total_time and coordinator._heap:
-        target = min(next_eval_time, total_time)
-        coordinator.run(until_time=target)
-
-        overall_results, client_results = evaluator.evaluate_online(
-            coordinator.all_clients, coordinator.online
-        )
-        log_queue.put((overall_results, client_results, today_date, exper_num, tick, args))
-
-        # 进度条更新（按墙钟时间前进量）
-        dt = coordinator.now - last_eval_now
-        if dt > 0:
-            pbar.update(dt)
-
-        # 展示关键指标
-        cur_acc = overall_results.get("accuracy_micro", overall_results.get("accuracy", 0.0))
-        cur_loss = overall_results.get("loss_micro", overall_results.get("loss", 0.0))
-        num_online = sum(1 for x in coordinator.online if x)
-        pbar.set_postfix(t=f"{coordinator.now:.2f}", acc=f"{cur_acc:.4f}",
-                         loss=f"{float(cur_loss):.4f}", online=num_online)
-
-        # 控制台简报
-        if overall_results:
-            s = ', '.join([f"{k.capitalize()}: {v:.4f}" for k, v in overall_results.items()])
-            print(f"[t={coordinator.now:.2f}] Δt={dt:.2f}  Eval: {s}")
-            if client_results:
-                max_cid = max(client_results, key=lambda cid: client_results[cid]["accuracy"])
-                min_cid = min(client_results, key=lambda cid: client_results[cid]["accuracy"])
-                print(f"Clients online: {len(client_results)} | "
-                      f"Max Acc: {client_results[max_cid]['accuracy']:.4f} (Client {max_cid}) | "
-                      f"Min Acc: {client_results[min_cid]['accuracy']:.4f} (Client {min_cid})")
-        else:
-            print(f"[t={coordinator.now:.2f}] No clients online yet.")
-
-        # 跟踪最优与时间加权
-        if overall_results and dt > 0:
-            acc_dt.append((float(cur_acc), dt))
-            online_hist.append(num_online)
-            if float(cur_acc) > best_acc:
-                best_acc = float(cur_acc)
-                best_time = coordinator.now
-            last_overall = overall_results
-
-        tick += 1
-        last_eval_now = coordinator.now
-        if eval_interval > 0:
-            next_eval_time += eval_interval
-        else:
-            break  # 只评一次
-
-    # 若还有剩余时间，推进到总时长并做最终评估
-    if eval_interval > 0 and coordinator.now < total_time:
-        coordinator.run(until_time=total_time)
-        overall_results, client_results = evaluator.evaluate_online(
-            coordinator.all_clients, coordinator.online
-        )
-        log_queue.put((overall_results, client_results, today_date, exper_num, tick, args))
-        dt_final = coordinator.now - last_eval_now
-        if dt_final > 0 and overall_results:
-            acc_dt.append((float(overall_results.get("accuracy_micro",
-                                                     overall_results.get("accuracy", 0.0))), dt_final))
-            online_hist.append(sum(1 for x in coordinator.online if x))
-            last_overall = overall_results
-            pbar.update(dt_final)
-            pbar.set_postfix(t=f"{coordinator.now:.2f}",
-                             acc=f"{overall_results.get('accuracy_micro', overall_results.get('accuracy', 0.0)):.4f}",
-                             loss=f"{float(overall_results.get('loss_micro', overall_results.get('loss', 0.0))):.4f}",
-                             online=sum(1 for x in coordinator.online if x))
-
-    pbar.close()
-
-    # 总结：时间加权平均 / 最优 / 期末
-    if acc_dt:
-        total_dt = sum(dt for _, dt in acc_dt)
-        twa = sum(acc * dt for acc, dt in acc_dt) / total_dt  # time-weighted average
-        final_acc = last_overall.get("accuracy_micro", last_overall.get("accuracy", 0.0))
-        mean_online = sum(online_hist) / len(online_hist) if online_hist else 0.0
-        print(f"[ASYNC Summary] T={total_time} "
-              f"| final_acc={final_acc:.4f} "
-              f"| best_acc={best_acc:.4f} @t={best_time:.2f} "
-              f"| time_weighted_acc={twa:.4f} "
-              f"| mean_online={mean_online:.2f}")
-
-    log_queue.put("STOP")
-    log_process.join()
 
 # --------------------------
 # 装配与入口
@@ -256,12 +136,16 @@ def run_async(coordinator: AsyncCoordinator, args, today_date, exper_num):
 def main():
     args = parse_args()
 
-    # 随机种子
+    try:
+        mp.set_start_method('spawn', force=True)
+        print("Multiprocessing start method set to 'spawn'.")
+    except RuntimeError as e:
+        print(f"Info: Multiprocessing start method already set or error: {e}")
+
+    # ... (种子, 设备, 日期, ... 保持不变) ...
     torch.manual_seed(args.seed)
     random.seed(args.seed)
     np.random.seed(args.seed)
-
-    # 设备
     if args.device == "cuda" and torch.cuda.is_available():
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
@@ -272,52 +156,99 @@ def main():
     else:
         device = torch.device("cpu")
     print(f"Using device: {device}")
-
     today = datetime.today().strftime('%Y-%m-%d')
     exper_num = get_experiment_num(today, args)
 
     with ExperimentLogger(today, exper_num, device, args) as logger:
         print("Initializing")
-        # 数据与模型
-        full_dataset = load_dataset(args.dataset_name)
-        model = load_model(args.model, num_classes=len(full_dataset.classes)).to(device)
+        # --- (!!! MODIFIED: 移除 full_dataset !!!) ---
+        # 我们让 worker 自己加载，以避免 CUDA 错误
+        # full_dataset = load_dataset(args.dataset_name)
+
+        # (获取数据集类数，用于模型加载)
+        if args.dataset_name == 'cifar10':
+            num_classes = 10
+        elif args.dataset_name == 'cifar100':
+            num_classes = 100
+        elif args.dataset_name == 'emnist':
+            num_classes = 62
+        elif args.dataset_name == 'tiny_imagenet':
+            num_classes = 200
+        elif args.dataset_name == 'mnist':
+            num_classes = 10
+        else:
+            raise ValueError(f"Unknown dataset {args.dataset_name}")
+
+        model = load_model(args.model, num_classes=num_classes).to(device)
         client_indices, num_clients = get_client_data_indices(
             args.dataset_indexes_dir, args.dataset_name, args.split_method, args.alpha
         )
 
-        # 异步：Join 时间表（单位=时间），并关闭协调器内部评估
-        join_time = build_join_table(num_clients, args, logger)
-
-        # 客户端
-        clients = create_client(num_clients, args, client_indices, full_dataset, join_time.keys(), device)
-
         if args.mode == "sync_fl":
-            # 同步：沿用旧的延迟机制（按轮次）
+            # --- 同步模式 (不变, 但需要加载 full_dataset) ---
+            print("Loading dataset for sync mode...")
+            full_dataset = load_dataset(args.dataset_name)  # 同步模式在主进程加载
             delay_rounds = get_client_delay_info(
                 num_clients, args.delay_client_ratio, args.minimum_join_rounds, args.n_rounds,
                 args.temp_client_dist, args.set_single_delay_client
             )
             logger.save("client_delay", delay_rounds)
+            clients = create_client(num_clients, args, client_indices, full_dataset, list(client_indices.keys()),
+                                    device)
             coordinator = Coordinator(clients, model, device, delay_rounds, args)
             run_sync(coordinator, args, today, exper_num)
+
         else:
+            # --- 异步模式 (修改) ---
+            join_time = build_join_table(num_clients, args, logger)
 
-            # 创建一个 args 副本，把 eval_interval 置 0（防止协调器内部也评估）
-            class _NS: pass
-            args_async = _NS()
-            for k, v in vars(args).items():
-                setattr(args_async, k, v)
-            args_async.eval_interval = 0.0
-            if args_async.k_push is None:
-                args_async.k_push = args_async.num_conn
+            log_queue = mp.Queue()
+            log_process = mp.Process(target=log_worker, args=(log_queue,))
+            log_process.start()
 
-            coordinator = AsyncCoordinator(clients, model, device, join_time, args_async, max_workers=args.n_job)
-            run_sync(coordinator, args, today, exper_num)
+            args.today_date = today
+            args.exper_num = exper_num
+            if args.k_push is None:
+                args.k_push = args.num_conn
+
+            # --- (!!! MODIFIED: 1. 在此处计算 total_time !!!) ---
+            total_time = float(args.total_time) if getattr(args, "total_time", None) is not None \
+                else float(getattr(args, "n_rounds", 50))
+            if total_time <= 0:
+                raise ValueError("total_time (or n_rounds fallback) must be > 0.")
+            # --- (!!! 结束 !!!) ---
+
+            # 4. 初始化多进程协调器
+            coordinator = AsyncCoordinator(
+                num_clients=num_clients,
+                model_template=model,
+                all_client_indices=client_indices,
+                log_queue=log_queue,
+                device=device,
+                client_delay_dict=join_time,
+                args=args,
+                max_workers=args.n_job,
+                total_time=total_time  # <--- 2. 传入 total_time
+            )
+
             print("Completed initialization")
             print("Start training")
-            run_async(coordinator, args, today, exper_num)
+
+            # 5. (!!! MODIFIED: 移除这里的 print !!!) ---
+            # print(f"Running async simulation for {total_time} virtual time units...")
+
+            # 6. 单次调用 run (不变)
+            coordinator.run(until_time=total_time)
+
+            # 7. 关闭协调器 (不变)
+            coordinator.shutdown()
+
+            # 8. 关闭日志进程 (不变)
+            log_queue.put("STOP")
+            log_process.join()
 
         print("Done")
+        return
 
 
 if __name__ == '__main__':

@@ -415,7 +415,8 @@ class ADFedMACClient(Client):
             # 延迟：完成一个 burst 计数
             if in_warmup:
                 self._warmup_done += 1
-        else:
+
+        if self.is_delayed:
             if len(self.dkm_layers) == 0:
                 self._register_dkm_layers()
 
