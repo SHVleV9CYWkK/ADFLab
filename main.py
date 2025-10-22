@@ -184,18 +184,6 @@ def run_async(coordinator: AsyncCoordinator, args, today_date, exper_num):
         pbar.set_postfix(t=f"{coordinator.now:.2f}", acc=f"{cur_acc:.4f}",
                          loss=f"{float(cur_loss):.4f}", online=num_online)
 
-        # 控制台简报
-        if overall_results:
-            s = ', '.join([f"{k.capitalize()}: {v:.4f}" for k, v in overall_results.items()])
-            print(f"[t={coordinator.now:.2f}] Δt={dt:.2f}  Eval: {s}")
-            if client_results:
-                max_cid = max(client_results, key=lambda cid: client_results[cid]["accuracy"])
-                min_cid = min(client_results, key=lambda cid: client_results[cid]["accuracy"])
-                print(f"Clients online: {len(client_results)} | "
-                      f"Max Acc: {client_results[max_cid]['accuracy']:.4f} (Client {max_cid}) | "
-                      f"Min Acc: {client_results[min_cid]['accuracy']:.4f} (Client {min_cid})")
-        else:
-            print(f"[t={coordinator.now:.2f}] No clients online yet.")
 
         # 跟踪最优与时间加权
         if overall_results and dt > 0:

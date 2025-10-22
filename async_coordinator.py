@@ -113,7 +113,7 @@ class AsyncCoordinator:
             ev = heapq.heappop(self._heap)
             # 终止条件（时间）
             if until_time is not None and ev.due > until_time:
-                # 把事件放回（可选），或直接结束；这里直接结束
+                heapq.heappush(self._heap, ev)
                 break
 
             # 推进时间
@@ -207,7 +207,8 @@ class AsyncCoordinator:
             for cid in online_ids:
                 self.all_clients[cid].update_lr()
 
-        # 调度下一次 EVAL_TICK
+        # 调度下一次 EVAL_TICK\
+        print(f"EVAL_TICK self.now: {self.now}, self.eval_interval:{self.eval_interval}， Total:{self.now + self.eval_interval}")
         self._push_event(self.now + self.eval_interval, "EVAL_TICK", None, 0)
 
     # ----------------------------------------------------------------------
