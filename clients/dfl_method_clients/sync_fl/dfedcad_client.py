@@ -54,7 +54,7 @@ class DFedCADClient(Client):
         teacher_centroids_dicts = []
         cfd_matrix = []
         # 遍历每个教师模型：三元组(权重, centroids, 索引)
-        for _, teacher_centroids, _ in self.neighbor_model_weights:
+        for _, teacher_centroids, _ in self.neighbor_model_weights_buffer:
             per_layer_cfd = []
             teacher_centroids_dicts.append(teacher_centroids)
             # 多层时建议做“加权平均或拼接后再算 CFD”
@@ -119,7 +119,7 @@ class DFedCADClient(Client):
 
     def _weight_aggregation(self):
         average_weights = {}
-        neighbor_model_weights = [model_weights for model_weights, _ , _ in self.neighbor_model_weights]
+        neighbor_model_weights = [model_weights for model_weights, _ , _ in self.neighbor_model_weights_buffer]
         for key in neighbor_model_weights[0].keys():
             weighted_sum = sum(neighbor_model_weights[i][key].to(self.device) for i in range(len(neighbor_model_weights)))
             average_weights[key] = weighted_sum / len(neighbor_model_weights)
@@ -214,7 +214,7 @@ class DFedCADClient(Client):
     def set_init_model(self, model):
         self.model = deepcopy(model)
         self.global_model = deepcopy(model)
-        self.is_align = len(self.neighbor_model_weights) != 0 and self.lambda_alignment != 0
+        self.is_align = len(self.neighbor_model_weights_buffer) != 0 and self.lambda_alignment != 0
 
     def train(self):
         if self.is_align and len(self.dkm_layers) == 0:
@@ -229,7 +229,7 @@ class DFedCADClient(Client):
             self._local_train()
 
         self.cluster_model = self._cluster_and_prune_model_weights()
-        self.neighbor_model_weights.clear()
+        self.neighbor_model_weights_buffer.clear()
 
     def send_model(self):
         return self.cluster_model

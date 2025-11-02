@@ -21,14 +21,14 @@ class AsyncDFedAvgClient(Client):
     # ---- 聚合：平均(自己 + 邻居) ----
     @torch.no_grad()
     def aggregate(self):
-        if len(self.neighbor_model_weights) == 0:
+        if len(self.neighbor_model_weights_buffer) == 0:
             return  # 没有邻居更新就不动
 
-        neighbor_weights_state = [neighbor[0] for neighbor in self.neighbor_model_weights]
+        neighbor_weights_state = [neighbor[0] for neighbor in self.neighbor_model_weights_buffer]
 
         # 取当前本地模型（作为被平均的第一项）
         current = {k: v.detach().clone().to(self.device) for k, v in self.model.state_dict().items()}
-        count = 1 + len(self.neighbor_model_weights)
+        count = 1 + len(self.neighbor_model_weights_buffer)
 
         # 累加邻居
         for sd in neighbor_weights_state:
@@ -47,7 +47,7 @@ class AsyncDFedAvgClient(Client):
         Join 时设置初始模型。若此刻缓冲里已经有邻居更新（一般很少见），则做一次聚合以充分利用信息。
         """
         self.model = deepcopy(model)
-        if len(self.neighbor_model_weights) != 0:
+        if len(self.neighbor_model_weights_buffer) != 0:
             self.aggregate()
 
     # ---- 本地训练 ----

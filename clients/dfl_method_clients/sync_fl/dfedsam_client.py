@@ -11,7 +11,7 @@ class DFedSAMClient(Client):
 
     def set_init_model(self, model):
         self.model = deepcopy(model)
-        if len(self.neighbor_model_weights) > 0:
+        if len(self.neighbor_model_weights_buffer) > 0:
             self.aggregate()
 
     def train(self):
@@ -55,12 +55,12 @@ class DFedSAMClient(Client):
                 self.optimizer.step()
 
         # Clear collected neighbor weights for next round
-        self.neighbor_model_weights.clear()
+        self.neighbor_model_weights_buffer.clear()
 
     def aggregate(self):
         avg_weights = self._weight_aggregation()
         self.model.load_state_dict(avg_weights)
-        self.neighbor_model_weights.clear()
+        self.neighbor_model_weights_buffer.clear()
 
     def send_model(self):
         return self.model.state_dict()

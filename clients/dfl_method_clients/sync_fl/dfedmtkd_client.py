@@ -41,7 +41,7 @@ class DFedMTKDClient(Client):
         self.teacher_features_outputs.append(output.detach())
 
     def train(self):
-        num_teachers = len(self.neighbor_model_weights)
+        num_teachers = len(self.neighbor_model_weights_buffer)
 
         for epoch in range(self.epochs):
             self.model.train()
@@ -79,7 +79,7 @@ class DFedMTKDClient(Client):
                 loss.backward()
                 self.optimizer.step()
 
-        self.neighbor_model_weights.clear()
+        self.neighbor_model_weights_buffer.clear()
 
     def send_model(self):
         return self.model.state_dict()

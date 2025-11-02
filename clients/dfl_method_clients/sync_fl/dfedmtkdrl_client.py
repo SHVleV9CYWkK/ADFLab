@@ -69,11 +69,11 @@ class DFedMTKDRLClient(DFedMTKDClient):
         其中 feats 来源于 teacher hook 捕获。
         """
         tea_logits_list, tea_feats_list = [], []
-        if not self.neighbor_model_weights:
+        if not self.neighbor_model_weights_buffer:
             return tea_logits_list, tea_feats_list
 
         with torch.inference_mode():
-            for t_state in self.neighbor_model_weights:         # M 个 teacher
+            for t_state in self.neighbor_model_weights_buffer:         # M 个 teacher
                 # 就地参数覆盖（父类已实现 _student_hook & _teacher_hook）
                 self._load_teacher_state_inplace(t_state)
 
@@ -133,17 +133,17 @@ class DFedMTKDRLClient(DFedMTKDClient):
     # ---------- 6. 预训练阶段 ----------
     def _pretrain_student(self):
         """用 teacher 硬 KD 先训学生 1 个 epoch（可选）"""
-        if not self.neighbor_model_weights:
+        if not self.neighbor_model_weights_buffer:
             return False
         super().train()                                        # 父类基于即时 KD 的 train()
         return True
 
     def _pretrain_agent(self):
         """用均匀权重作为目标，预训 agent"""
-        if not self.neighbor_model_weights:
+        if not self.neighbor_model_weights_buffer:
             return False
 
-        M      = len(self.neighbor_model_weights)
+        M      = len(self.neighbor_model_weights_buffer)
         target = torch.full((1, M), 1 / M, device=self.device)  # [1, M]
         self.agent.train()
 
@@ -197,7 +197,7 @@ class DFedMTKDRLClient(DFedMTKDClient):
                 tea_logits_list, tea_feat_list = [], []
                 weights, log_prob = None, None
 
-                if self.neighbor_model_weights:
+                if self.neighbor_model_weights_buffer:
                     # 即时推理所有 teacher
                     tea_logits_list, tea_feat_list = self._forward_teacher_batch(x)
 
@@ -236,7 +236,7 @@ class DFedMTKDRLClient(DFedMTKDClient):
                 self.optimizer.step()
 
                 # ---- 累积 RL buffer (只在 agent 阶段) ----
-                if self._agent_pretrained and self.neighbor_model_weights:
+                if self._agent_pretrained and self.neighbor_model_weights_buffer:
                     # reward 依据教师损失越小越好，取负
                     kl_det  = torch.stack([
                                   F.kl_div(
@@ -275,4 +275,4 @@ class DFedMTKDRLClient(DFedMTKDClient):
                 policy_loss.backward()
                 self.agent_optimizer.step()
 
-        self.neighbor_model_weights.clear()
+        self.neighbor_model_weights_buffer.clear()

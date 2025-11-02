@@ -8,11 +8,11 @@ class DFedAvgClient(Client):
 
     def aggregate(self):
         self.model.load_state_dict(self._weight_aggregation())
-        self.neighbor_model_weights.clear()
+        self.neighbor_model_weights_buffer.clear()
 
     def set_init_model(self, model):
         self.model = deepcopy(model)
-        if len(self.neighbor_model_weights) != 0:
+        if len(self.neighbor_model_weights_buffer) != 0:
             self.aggregate()
 
     def train(self):

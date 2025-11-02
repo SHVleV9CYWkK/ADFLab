@@ -73,14 +73,14 @@ class DFedPGPClient(Client):
         return {k: self.u[k] * 1.0 for k in self.shared_keys}, self.mu
 
     def aggregate(self):
-        if not self.neighbor_model_weights:
+        if not self.neighbor_model_weights_buffer:
             return
 
         # Push-sum aggregation
         aggregated_u = {k: torch.zeros_like(v, dtype=torch.float32) for k, v in self.u.items()}
         aggregated_mu = 0.0
 
-        for u_j, mu_j in self.neighbor_model_weights:
+        for u_j, mu_j in self.neighbor_model_weights_buffer:
             for k in aggregated_u:
                 aggregated_u[k] += u_j[k]
             aggregated_mu += mu_j
@@ -88,4 +88,4 @@ class DFedPGPClient(Client):
         self.u = aggregated_u
         self.mu = aggregated_mu
         self.z = {k: self.u[k] / self.mu for k in self.u}
-        self.neighbor_model_weights.clear()
+        self.neighbor_model_weights_buffer.clear()

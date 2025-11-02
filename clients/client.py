@@ -80,7 +80,7 @@ class Client(ABC):
 
         # ======= 接收端策略（异步下的缓冲与即时融合）=======
         self.buffer_limit: int = int(hyperparam.get('buffer_limit', 10))
-        self.neighbor_model_weights: list[Dict[str, torch.Tensor]] = []
+        self.neighbor_model_weights_buffer: list[Dict[str, torch.Tensor]] = []
 
         # 评估时的全局指标记录（保留原字段）
         self.global_metric = self.global_epoch = 0
@@ -178,19 +178,19 @@ class Client(ABC):
     def receive_neighbor_model(self, neighbor_model):
         sender_id = neighbor_model[-1]["sender_id"]
 
-        for idx ,item in enumerate(self.neighbor_model_weights):
+        for idx ,item in enumerate(self.neighbor_model_weights_buffer):
             if item[-1]["sender_id"] == sender_id:
-                self.neighbor_model_weights.pop(idx)
+                self.neighbor_model_weights_buffer.pop(idx)
                 break
 
-        self.neighbor_model_weights.append(neighbor_model)
+        self.neighbor_model_weights_buffer.append(neighbor_model)
 
         # 控制缓冲大小
         if self.buffer_limit is not None and self.buffer_limit > 0:
-            overflow = len(self.neighbor_model_weights) - self.buffer_limit
+            overflow = len(self.neighbor_model_weights_buffer) - self.buffer_limit
             if overflow > 0:
                 # 丢弃最旧
-                self.neighbor_model_weights = self.neighbor_model_weights[overflow:]
+                self.neighbor_model_weights_buffer = self.neighbor_model_weights_buffer[overflow:]
 
 
     def evaluate_model(self) -> Dict[str, float]:
@@ -261,17 +261,17 @@ class Client(ABC):
     # -----------------------------
     def _weight_aggregation(self) -> Dict[str, torch.Tensor]:
         """对缓冲中的若干 state_dict 做简单平均（在 device 上），返回新的权重字典。"""
-        if len(self.neighbor_model_weights) == 0:
+        if len(self.neighbor_model_weights_buffer) == 0:
             raise RuntimeError("neighbor_model_weights 为空，无法聚合。")
         average_weights: Dict[str, torch.Tensor] = {}
-        keys = list(self.neighbor_model_weights[0].keys())
+        keys = list(self.neighbor_model_weights_buffer[0].keys())
         for k in keys:
             # 累加到 device，再做平均
             acc = None
-            for sd in self.neighbor_model_weights:
+            for sd in self.neighbor_model_weights_buffer:
                 tensor = sd[k].to(self.device)
                 acc = tensor if acc is None else (acc + tensor)
-            average_weights[k] = acc / float(len(self.neighbor_model_weights))
+            average_weights[k] = acc / float(len(self.neighbor_model_weights_buffer))
         return average_weights
 
     def _steps_per_burst(self) -> int:

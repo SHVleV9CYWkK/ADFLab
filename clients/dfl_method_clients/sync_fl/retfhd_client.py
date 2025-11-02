@@ -59,7 +59,7 @@ class ReTFHDClient(Client):
         for layer in self.model.modules():
             if hasattr(layer, 'reset_parameters'):
                 layer.reset_parameters()
-        if len(self.neighbor_model_weights) != 0:
+        if len(self.neighbor_model_weights_buffer) != 0:
             self.aggregate()
 
     def receive_neighbor_model(self, logits_tensor):
