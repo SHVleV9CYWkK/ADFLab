@@ -161,9 +161,7 @@ class AsyncCoordinator:
         """
         client = self.all_clients[cid]
 
-        buf = getattr(client, "neighbor_model_weights", None)
-        if buf is not None and len(buf) > 0:
-            client.aggregate()
+        client.aggregate()
 
         # 1) 本地训练（子类可在 train() 内调用 _local_train()）
         client.train()

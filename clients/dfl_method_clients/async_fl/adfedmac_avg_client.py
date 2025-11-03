@@ -6,6 +6,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
 
+import math
+
 from clients.client import Client
 from utils.kmeans import TorchKMeans
 
@@ -51,7 +53,7 @@ class ADFedMACClient(Client):
         self.beta_num: float = float(hp.get('beta_num', 2.0))          # 数值温度
 
         # 成熟度 & 历史
-        self.maturity_tau: float = float(hp.get('maturity_tau', 10.0)) # SWAG 精度的严格度
+        self.maturity_tau: float = float(hp.get('maturity_tau', 1e4)) # SWAG 精度的严格度
         self.maturity_eps: float = float(hp.get('maturity_eps', 1e-5))
         self.beta_drift: float = float(hp.get('beta_drift', 2.0))
         self.beta_invar: float = float(hp.get('beta_invar', 1.0))
@@ -105,7 +107,7 @@ class ADFedMACClient(Client):
             self._local_mask_hist[layer].append(m.detach())
 
     # ------------------------- 聚类 + 掩码（不写回模型） -------------------------
-    def _cluster_and_prune_model_weights(self, keep_ratio: float = 0.9):
+    def _cluster_and_prune_model_weights(self):
         """
         返回:
           clustered: 聚类重构后的权重（未写回）
@@ -120,45 +122,30 @@ class ADFedMACClient(Client):
 
         state = self.model.state_dict()
         for key, w in state.items():
-            if ('weight' in key) and ('bn' not in key) and ('downsample' not in key):
-                w_dev = w.detach().to(self.device)
-                orig = w_dev.shape
-                flat = w_dev.view(-1, 1).contiguous().float()
-
+            if 'weight' in key and 'bn' not in key and 'downsample' not in key:
+                orig = w.shape
                 kmeans = TorchKMeans(n_clusters=self.n_clusters, is_sparse=True)
-                kmeans.fit(flat)  # .centroids:[K,1], .labels_:[N]
-
+                flat = w.detach().view(-1, 1)
+                kmeans.fit(flat)
                 cent_sorted, lab_sorted = self._sort_centroids_and_remap(
                     kmeans.centroids.view(-1, 1), kmeans.labels_)
                 new_w = cent_sorted[lab_sorted].view(orig)
-
-                # 掩码：按质心幅度累计占比保留
-                mags = cent_sorted.abs().view(-1)        # [K]
-                sorted_mags, idx = torch.sort(mags, descending=True)
-                cum = torch.cumsum(sorted_mags, dim=0)
-                cutoff = keep_ratio * sorted_mags.sum().clamp_min(1e-12)
-                K_keep = int((cum <= cutoff).sum().item())
-                K_keep = max(K_keep, max(1, int(self.n_clusters * keep_ratio)))
-                keep_ids = set(idx[:K_keep].tolist())
-                is_kept = torch.tensor([i in keep_ids for i in range(self.n_clusters)],
-                                       device=self.device, dtype=torch.bool)
-                m = is_kept[lab_sorted].view(orig)
+                is_zero = (cent_sorted.view(-1) == 0)
+                m = (is_zero[lab_sorted].view(orig) == 0)
 
                 clustered[key] = new_w
-                mask[key] = m.bool().to(w.device)
+                mask[key] = m.bool()
                 cents[key] = cent_sorted.to(self.device)
                 labels[key] = lab_sorted.view(-1).to(self.device)
             else:
                 clustered[key] = w.detach().to(w.device)
                 mask[key] = torch.ones_like(w, dtype=torch.bool, device=w.device)
-                cents[key] = None
-                labels[key] = None
 
         self.mask = mask
         self._update_local_history(cents, mask)
         return clustered, cents, labels
 
-    # —— 就地应用掩码（避免每 batch load_state_dict） ——
+    # —— 就地应用掩码 ——
     def _apply_prune_mask_inplace(self):
         with torch.no_grad():
             for name, p in self.model.named_parameters():
@@ -170,7 +157,7 @@ class ADFedMACClient(Client):
         # SWAG 风格相对方差 → 精度（大表示稳定）
         last = hist[-1]
         if len(hist) < 2:
-            return last.new_ones(last.shape[0], 1)
+            return last.new_zeros(last.shape[0], 1)
 
         stack = torch.stack(list(hist), dim=0)  # [T,K,1]
         mu = stack.mean(dim=0)                  # [K,1]
@@ -186,8 +173,8 @@ class ADFedMACClient(Client):
                           mask_now: torch.Tensor) -> torch.Tensor:
         dev = cents_now.device
         # 漂移（与上一帧质心差）
-        if len(self._local_hist.get(layer_key, [])) >= 1:
-            prev_c = self._local_hist[layer_key][-1].to(dev)
+        if len(self._local_hist.get(layer_key, [])) >= 2:
+            prev_c = self._local_hist[layer_key][-2].to(dev)
             drift = torch.abs(cents_now - prev_c)  # [K,1]
         else:
             drift = torch.zeros_like(cents_now)
@@ -198,8 +185,8 @@ class ADFedMACClient(Client):
         invar = self._cluster_intra_var(flat_w, labels_now, K, eps=self.maturity_eps)  # [K,1]
 
         # 掩码翻转率（层级标量）
-        if len(self._local_mask_hist.get(layer_key, [])) >= 1:
-            prev_m = self._local_mask_hist[layer_key][-1].to(dev)
+        if len(self._local_mask_hist.get(layer_key, [])) >= 2:
+            prev_m = self._local_mask_hist[layer_key][-2].to(dev)
             flips = (prev_m ^ mask_now).float().mean()  # scalar
         else:
             flips = torch.tensor(0.0, device=dev)
@@ -222,14 +209,15 @@ class ADFedMACClient(Client):
     def _prepare_maturity_meta(self, cents: Dict[str, torch.Tensor],
                                labels: Dict[str, torch.Tensor]) -> Dict[str, Any]:
         layer_maturity = {}
-        for layer_key, c_now in cents.items():
-            if c_now is None:
-                continue
-            self._ensure_hist_slot(layer_key)
-            m_now = self.mask[layer_key].to(c_now.device)
-            l_now = labels[layer_key]
-            maturity_vec = self._local_maturity(layer_key, c_now, l_now, m_now)
-            layer_maturity[layer_key] = float(maturity_vec.mean().item())
+        # for layer_key, c_now in cents.items():
+        #     if c_now is None:
+        #         continue
+        #     self._ensure_hist_slot(layer_key)
+        #     m_now = self.mask[layer_key].to(c_now.device)
+        #     l_now = labels[layer_key]
+        #     maturity_vec = self._local_maturity(layer_key, c_now, l_now, m_now)
+        #     layer_maturity[layer_key] = float(maturity_vec.mean().item())
+
         return {
             'version_meta': 'adfedmac_meta_v1',
             'sender_id': self.id,
@@ -238,138 +226,175 @@ class ADFedMACClient(Client):
             'layer_maturity': layer_maturity
         }
 
-    # ------------------------- 相似度：数值 × 语义 -------------------------
-    @staticmethod
-    def _pairwise_cosine_01(A: torch.Tensor, B: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
-        # A:[K,C], B:[K,C] → [K,K] in [0,1]
-        A_n = A / (A.norm(dim=1, keepdim=True) + eps)
-        B_n = B / (B.norm(dim=1, keepdim=True) + eps)
-        S = A_n @ B_n.t()  # [-1,1]
-        return S.clamp_min(0.0)
-
-    @staticmethod
-    def _numeric_sim(C: torch.Tensor, C_peer: torch.Tensor, beta_num: float = 2.0, eps: float = 1e-8) -> torch.Tensor:
-        # C, C_peer: [K,D] -> N:[K,K] in (0,1]
-        D2 = torch.cdist(C, C_peer, p=2).pow(2)        # [K,K]
+    def _soft_jaccard_from_centroids(self,
+                                     C: torch.Tensor,  # [K,D]
+                                     C_peer: torch.Tensor,  # [K,D]
+                                     a: torch.Tensor,  # [K] 本地簇占比
+                                     b: torch.Tensor,  # [K] 邻居簇占比
+                                     beta_sem: float = 5.0,
+                                     eps: float = 1e-8) -> torch.Tensor:
+        """
+        用“簇→对方簇”的 softmax 构造 soft-Jaccard：
+          P_{i→j} = softmax_j(-β_sem * ||C_i - C'_j||^2 / med)
+          Q_{j→i} = softmax_i(-β_sem * ||C'_j - C_i||^2 / med)
+          inter_ij = sqrt( a_i * P_{i→j} * b_j * Q_{j→i} )
+          union_ij = a_i + b_j - inter_ij
+          J_ij = inter_ij / (union_ij + eps)
+        返回 J:[K,K] ∈ (0,1]
+        """
+        K = C.shape[0]
+        D2 = torch.cdist(C, C_peer, p=2).pow(2)  # [K,K]
         scale = D2.median() + eps
-        return torch.exp(- beta_num * D2 / scale)
 
-    def _layer_similarity_mixed(self,
-                                layer_key: str,
-                                C: torch.Tensor,            # [K,D]
-                                C_peer: torch.Tensor,       # [K,D]
-                                Sem: torch.Tensor | None,   # [K,C] or None
-                                Sem_peer: torch.Tensor | None,
-                                alpha_sem: float = 0.5,
-                                beta_num: float = 2.0,
-                                eps: float = 1e-8) -> torch.Tensor:
-        N = self._numeric_sim(C, C_peer, beta_num=beta_num, eps=eps)   # [K,K]
-        if (Sem is not None) and (Sem_peer is not None):
-            S = self._pairwise_cosine_01(Sem, Sem_peer, eps=eps)       # [K,K]
-            logits = (1 - alpha_sem) * (N + eps).log() + alpha_sem * (S + eps).log()
-        else:
-            logits = (N + eps).log()
-        A = torch.softmax(logits, dim=1)                               # row-stochastic
-        s_layer = (A * N).sum(dim=1).mean()                            # scalar
+        logits_L2R = - D2 / scale * beta_sem  # [K,K]
+        logits_R2L = logits_L2R.t().contiguous()  # [K,K]
+
+        P = torch.softmax(logits_L2R, dim=1)  # local→peer
+        Q = torch.softmax(logits_R2L, dim=1)  # peer →local
+
+        a = a.view(K, 1)  # [K,1]
+        b = b.view(1, K)  # [1,K]
+        inter = torch.sqrt((a * P) * (b * Q.t()))  # [K,K]
+        union = a + b - inter
+        J = inter / (union + eps)
+        return J.clamp(0.0, 1.0)
+
+    def _layer_similarity_mix(self,
+                                  C: torch.Tensor, C_peer: torch.Tensor,  # [K,D]
+                                  a: torch.Tensor, b: torch.Tensor,  # [K], [K]
+                                  alpha_sem: float = 0.5,
+                                  beta_num: float = 2.0,
+                                  beta_sem: float = 5.0,
+                                  eps: float = 1e-8) -> torch.Tensor:
+        """
+        DKM 样式融合：
+          S: 数值相似（exp(-β_num * d^2 / med)）      → 置信度
+          J: 语义相似（上面的 soft-Jaccard）          → 语义一致性
+          M = (J+eps)^{α} * (S+eps)^{1-α}
+          A = softmax_j( log M )                    → 软匹配
+          s_layer = mean_i Σ_j A_ij * S_ij          → 层标量相似度 (0,1]
+        """
+        # 数值相似
+        D2 = torch.cdist(C, C_peer, p=2).pow(2)  # [K,K]
+        scale = D2.median() + eps
+        S = torch.exp(- beta_num * D2 / scale)  # [K,K] in (0,1]
+
+        # soft-Jaccard（语义）
+        J = self._soft_jaccard_from_centroids(C, C_peer, a, b, beta_sem=beta_sem, eps=eps)  # [K,K]
+
+        # 融合 & 行 softmax
+        logits = (1 - alpha_sem) * (S + eps).log() + alpha_sem * (J + eps).log()
+        A = torch.softmax(logits, dim=1)  # [K,K]
+
+        s_layer = (A * S).sum(dim=1).mean()  # scalar
         return (1.0 - torch.exp(-s_layer)).clamp(0.0, 1.0)
 
-    def _layer_size(self, layer_key: str, fallback_tensor: torch.Tensor | None) -> int:
-        # 用掩码保留数量或参数总数作为层规模
-        m = self.mask.get(layer_key, None)
-        if m is not None:
-            return int(m.to(torch.int).sum().item())
-        if fallback_tensor is not None:
-            return int(fallback_tensor.numel())
-        return int(self.model.state_dict()[layer_key].numel())
-
-    def _neighbor_similarity_mixed(self,
-                                   local_cents: Dict[str, torch.Tensor],
-                                   neighbor_cents: Dict[str, torch.Tensor],
-                                   neighbor_sem: Dict[str, torch.Tensor] | None,
-                                   alpha_sem: float,
-                                   beta_num: float) -> float:
+    def _neighbor_similarity(self,
+                                 local_cents: Dict[str, torch.Tensor],
+                                 neighbor_cents: Dict[str, torch.Tensor],
+                                 local_labels: Dict[str, torch.Tensor] | None,
+                                 neighbor_labels: Dict[str, torch.Tensor] | None,
+                                 alpha_sem: float,
+                                 beta_num: float,
+                                 beta_sem: float = 5.0) -> float:
+        """
+        对每层：
+          - C, C_peer → [K,D]
+          - a, b 来自 labels 的计数占比；若无 labels 则 a=b=均匀
+          - 得到 s_layer（上面函数）
+        最后按层规模（被保留参数量）做加权平均，得出该邻居的整体相似度 s ∈ (0,1]。
+        """
         per_s, per_sz = [], []
         sd = self.model.state_dict()
+
         for layer_key, C in local_cents.items():
             C_peer = neighbor_cents.get(layer_key, None)
-            if (C is None) or (C_peer is None):
+            if C is None or C_peer is None:
                 continue
 
-            # 展平到 [K,D]
             C = C.view(C.shape[0], -1).float().to(self.device)
             C_peer = C_peer.view(C_peer.shape[0], -1).float().to(self.device)
+            K = C.shape[0]
 
-            # 语义签名（可选）
-            Sem = self._local_sem.get(layer_key, None)
-            Sem_peer = None
-            if neighbor_sem is not None:
-                Sem_peer = neighbor_sem.get(layer_key, None)
-                if Sem_peer is not None:
-                    Sem_peer = torch.as_tensor(Sem_peer, device=self.device, dtype=torch.float)
+            # 簇占比 a（本地），b（邻居）
+            if (local_labels is not None) and (local_labels.get(layer_key) is not None):
+                la = local_labels[layer_key].to(self.device).view(-1)
+                a_counts = torch.bincount(la, minlength=K).float()
+            else:
+                a_counts = torch.ones(K, device=self.device)
+            if (neighbor_labels is not None) and (neighbor_labels.get(layer_key) is not None):
+                lb = neighbor_labels[layer_key].to(self.device).view(-1)
+                b_counts = torch.bincount(lb, minlength=K).float()
+            else:
+                b_counts = torch.ones(K, device=self.device)
+            a = a_counts / (a_counts.sum() + 1e-8)
+            b = b_counts / (b_counts.sum() + 1e-8)
 
-            sL = self._layer_similarity_mixed(
-                layer_key, C, C_peer, Sem, Sem_peer,
-                alpha_sem=alpha_sem, beta_num=beta_num
+            sL = self._layer_similarity_mix(
+                C, C_peer, a, b,
+                alpha_sem=alpha_sem, beta_num=beta_num, beta_sem=beta_sem
             )
             per_s.append(sL)
-            per_sz.append(self._layer_size(layer_key, sd.get(layer_key, None)))
+
+            # 层规模：用掩码保留数或参数总数
+            m = self.mask.get(layer_key, None)
+            if m is not None:
+                per_sz.append(int(m.to(torch.int).sum().item()))
+            else:
+                per_sz.append(int(sd[layer_key].numel()))
 
         if len(per_s) == 0:
             return 0.5
+
         s = torch.stack(per_s).to(self.device)
-        w = torch.tensor(per_sz, device=self.device, dtype=torch.float)
+        w = torch.tensor(per_sz, device=self.device).float()
         w = w / (w.sum() + 1e-8)
         return float((s * w).sum().item())
 
     # ------------------------- 邻居权重（相似度 × 成熟度^γ × 新鲜度） -------------------------
     @torch.no_grad()
     def _compute_peer_weights(self,
-                              local_cents: Dict[str, torch.Tensor],
-                              alpha_sem: float = None,
-                              beta_num: float = None) -> List[float]:
+                              local_cents: Dict[str, torch.Tensor]) -> List[float]:
         if len(self.neighbor_model_weights_buffer) == 0:
             return []
-        if alpha_sem is None:
-            alpha_sem = self.alpha_sem
-        if beta_num is None:
-            beta_num = self.beta_num
 
         t_now = float(getattr(self, "last_update_time", 0.0))
         scores = []
 
         for (peer_state, peer_cents, peer_labels, peer_meta) in self.neighbor_model_weights_buffer:
-            # 语义字典（可选）
-            neighbor_sem = None
-            if isinstance(peer_meta, dict) and ('layer_semantics' in peer_meta):
-                # 允许已是张量或 numpy/list
-                neighbor_sem = {k: torch.as_tensor(v) for k, v in peer_meta['layer_semantics'].items()}
-
             # 相似度：数值×语义
-            s = self._neighbor_similarity_mixed(local_cents, peer_cents, neighbor_sem,
-                                                alpha_sem=alpha_sem, beta_num=beta_num)
+            s = self._neighbor_similarity(
+                local_cents=local_cents,
+                neighbor_cents=peer_cents,
+                local_labels=self.cluster_model[2] if (self.cluster_model is not None) else None,
+                neighbor_labels=peer_labels,
+                alpha_sem=self.alpha_sem,
+                beta_num=self.beta_num,
+                beta_sem=getattr(self, "beta_sem", 5.0),
+            )
 
             # 成熟度：按层规模加权均值
-            m = 1.0
-            if isinstance(peer_meta, dict) and ('layer_maturity' in peer_meta):
-                ms, szs = [], []
-                for layer_key, c in local_cents.items():
-                    if c is None:
-                        continue
-                    ml = peer_meta['layer_maturity'].get(layer_key, None)
-                    if ml is None:
-                        continue
-                    ms.append(float(ml))
-                    szs.append(self._layer_size(layer_key, None))
-                if ms:
-                    ms_t = torch.tensor(ms, device=self.device).float()
-                    sz_t = torch.tensor(szs, device=self.device).float()
-                    m = float((ms_t * (sz_t / (sz_t.sum() + 1e-8))).sum().item())
+            # m = 1.0
+            # if isinstance(peer_meta, dict) and ('layer_maturity' in peer_meta):
+            #     ms, szs = [], []
+            #     for layer_key, c in local_cents.items():
+            #         if c is None:
+            #             continue
+            #         ml = peer_meta['layer_maturity'].get(layer_key, None)
+            #         if ml is None:
+            #             continue
+            #         ms.append(float(ml))
+            #         szs.append(self._layer_size(layer_key, None))
+            #     if ms:
+            #         ms_t = torch.tensor(ms, device=self.device).float()
+            #         sz_t = torch.tensor(szs, device=self.device).float()
+            #         m = float((ms_t * (sz_t / (sz_t.sum() + 1e-8))).sum().item())
 
             # 新鲜度
-            # sender_time = float(peer_meta.get('sender_time', t_now)) if isinstance(peer_meta, dict) else t_now
-            # r = math.exp(- self.lambda_time * max(0.0, t_now - sender_time))
+            sender_time = float(peer_meta.get('sender_time', t_now)) if isinstance(peer_meta, dict) else t_now
+            r = math.exp(- self.lambda_time * max(0.0, t_now - sender_time))
 
-            score = max(self.sim_eps, s) * (max(self.sim_eps, m) ** self.gamma_maturity) # * r
+            score = max(self.sim_eps, s) * r
             scores.append(score)
 
         Z = sum(scores) + self.sim_eps
@@ -406,10 +431,33 @@ class ADFedMACClient(Client):
         """
         n = len(self.neighbor_model_weights_buffer)
         if n == 0:
-            return  # 无邻居就不聚合
+            return  # 无邻居或无训练就不聚合
+
+        if self.cluster_model is None:
+            # 通过邻居的质心聚合出初始模型
+            neighbor_states = [tpl[0] for tpl in self.neighbor_model_weights_buffer]
+            if len(neighbor_states) == 0:
+                return
+
+            # 初始化为邻居模型的简单平均
+            avg_state = {}
+            keys = set(neighbor_states[0].keys())
+
+            for k in keys:
+                acc = None
+                for st in neighbor_states:
+                    t = st[k].to(self.device)
+                    acc = t if acc is None else acc.add(t)
+                avg_state[k] = acc.div(len(neighbor_states))
+
+            # 写回到模型并缓存 cluster_model
+            self.model.load_state_dict(avg_state)
+            # 立即做一次聚类，保证后续能计算相似度
+            self.cluster_model = self._cluster_and_prune_model_weights()
+
 
         # 1) 本地最新质心（用于相似度）
-        _, local_cents, _ = self._cluster_and_prune_model_weights()
+        _, local_cents, _ = self.cluster_model
 
         # 2) 邻居相对权重（和为 1）
         neighbor_rel = self._compute_peer_weights(local_cents)  # 长度 n，∑=1
@@ -417,12 +465,7 @@ class ADFedMACClient(Client):
             return
 
         neighbor_states = [tpl[0] for tpl in self.neighbor_model_weights_buffer]
-        # 求所有邻居共同的键
         keys = set(neighbor_states[0].keys())
-        for st in neighbor_states[1:]:
-            keys &= set(st.keys())
-        if not keys:
-            return
 
         # 3) 动态自锚点
         local_w = 1.0 / (n + 1.0)  # 本地 1/(n+1)
@@ -442,13 +485,7 @@ class ADFedMACClient(Client):
             acc = acc.add(t_local, alpha=local_w)
             avg[k] = acc
 
-        # 非交集键保留本地
-        local_sd = self.model.state_dict()
-        for k in local_sd:
-            if k not in avg:
-                avg[k] = local_sd[k].to(self.device)
-
-        self.global_model.load_state_dict(avg)
+        self.model.load_state_dict(avg)
 
 
     # ------------------------- 训练总流程 -------------------------
@@ -461,16 +498,6 @@ class ADFedMACClient(Client):
     # ------------------------- 初始化 / 发送 -------------------------
     def set_init_model(self, model: nn.Module):
         self.model = deepcopy(model).to(self.device)
-        self.global_model = deepcopy(model).to(self.device)
-
-    def _build_layer_semantics(self) -> Dict[str, torch.Tensor]:
-        """
-        （可选）构造本地语义签名：{layer_key: Tensor[K,C]}。
-        这里给出一个占位实现（返回空字典），
-        若你已实现“梯度/激活语义”，可在此处填充并同步到 self._local_sem。
-        """
-        # 示例：return self._local_sem  # 如果你在其它流程中已构建
-        return {}
 
     def send_model(self):
         """
@@ -485,18 +512,6 @@ class ADFedMACClient(Client):
         else:
             clustered_state_dict, cents, labels = self.cluster_model
 
-        # 可选：收集语义签名
-        layer_sem = self._build_layer_semantics()
-        if isinstance(layer_sem, dict) and len(layer_sem) > 0:
-            # 同步缓存（可选）
-            self._local_sem.update({k: v.to(self.device) for k, v in layer_sem.items()})
-
         meta = self._prepare_maturity_meta(cents, labels)
-        if len(layer_sem) > 0:
-            # 注意：meta 内建议放 CPU 可序列化对象；如有张量，转为 cpu().numpy().tolist()
-            meta['layer_semantics'] = {
-                k: (v.detach().cpu().numpy().tolist() if torch.is_tensor(v) else v)
-                for k, v in layer_sem.items()
-            }
 
         return clustered_state_dict, cents, labels, meta
