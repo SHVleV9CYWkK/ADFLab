@@ -8,6 +8,8 @@ import torch.nn as nn
 
 import math
 
+from networkx.classes import neighbors
+
 from clients.client import Client
 from utils.kmeans import TorchKMeans
 
@@ -27,7 +29,6 @@ class ADFedMACClient(Client):
         super().__init__(client_id, dataset_index, full_dataset, hp, device)
 
         # ... (缓存, 掩码, 历史等保持不变) ...
-        self.neighbor_model_weights_buffer: List[Any] = []
         self.cluster_model: Optional[
             Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor], Dict[str, torch.Tensor]]
         ] = None
@@ -41,12 +42,10 @@ class ADFedMACClient(Client):
         self.epochs: int = int(hp.get('epochs', 1))
 
         # 相似度超参
-        # 注意: alpha_sem 和 beta_sem 不再使用
-        # beta_num 现在用作 Wasserstein 距离的温度系数
         self.beta_num: float = float(hp.get('beta_num', 2.0))
 
         # ... (成熟度, 新鲜度, 训练超参保持不变) ...
-        self.maturity_tau: float = float(hp.get('maturity_tau', 1e4))
+        self.maturity_tau: float = float(hp.get('maturity_tau', 10.0))
         self.maturity_eps: float = float(hp.get('maturity_eps', 1e-5))
         self.beta_drift: float = float(hp.get('beta_drift', 2.0))
         self.beta_invar: float = float(hp.get('beta_invar', 1.0))
@@ -137,8 +136,6 @@ class ADFedMACClient(Client):
                     p.mul_(self.mask[name].to(p.device))
 
     # ------------------------- 成熟度 (M) -------------------------
-    # ... ( _c_swag_precision, _stability_scores, _local_maturity, _prepare_maturity_meta 保持不变) ...
-    # (我们保留上一版中完整的、功能正常的成熟度计算)
     def _c_swag_precision(self, hist: deque) -> torch.Tensor:
         last = hist[-1]
         if len(hist) < 2:
@@ -155,11 +152,14 @@ class ADFedMACClient(Client):
                           labels_now: torch.Tensor,
                           mask_now: torch.Tensor) -> torch.Tensor:
         dev = cents_now.device
-        if len(self._local_hist.get(layer_key, [])) >= 2:
-            prev_c = self._local_hist[layer_key][-2].to(dev)
-            drift = torch.abs(cents_now - prev_c)
+        hist = self._local_hist.get(layer_key, [])
+        if len(hist) >= 3:
+            c_t = hist[-1].to(dev)
+            c_t1 = hist[-2].to(dev)
+            c_t2 = hist[-3].to(dev)
+            accel = torch.abs((c_t - c_t1) - (c_t1 - c_t2))  # 加速度
         else:
-            drift = torch.zeros_like(cents_now)
+            accel = torch.zeros_like(cents_now)
         flat_w = self.model.state_dict()[layer_key].to(dev).view(-1, 1).detach()
         K = cents_now.shape[0]
         invar = self._cluster_intra_var(flat_w, labels_now, K, eps=self.maturity_eps)
@@ -168,7 +168,7 @@ class ADFedMACClient(Client):
             flips = (prev_m ^ mask_now).float().mean()
         else:
             flips = torch.tensor(0.0, device=dev)
-        stab = torch.exp(- self.beta_drift * drift - self.beta_invar * invar - self.beta_mask * flips)
+        stab = torch.exp(- self.beta_drift * accel - self.beta_invar * invar - self.beta_mask * flips)
         return stab
 
     def _local_maturity(self, layer_key: str,
@@ -211,7 +211,7 @@ class ADFedMACClient(Client):
             C_a: torch.Tensor, C_b: torch.Tensor, a: torch.Tensor, b: torch.Tensor
     ) -> torch.Tensor:
         """
-        【新】使用 PyTorch 计算两个 1D 离散分布之间的 Wasserstein-1 距离。
+        计算两个 1D 离散分布之间的 Wasserstein-1 距离。
         C_a, C_b: 质心值 (values) [K, 1]
         a, b: 簇占比 (weights/probabilities) [K]
 
@@ -330,8 +330,7 @@ class ADFedMACClient(Client):
 
     # ------------------------- 邻居权重（S × M^γ × R）-------------------------
     @torch.no_grad()
-    def _compute_peer_weights(self,
-                              local_cents: Dict[str, torch.Tensor]) -> List[float]:
+    def _compute_peer_weights(self) -> List[float]:
         """
         【已更新】
         调用新的 EMD _neighbor_similarity，不再返回 A 矩阵
@@ -380,6 +379,9 @@ class ADFedMACClient(Client):
 
             # 最终得分
             score = max(self.sim_eps, s) * m_score * r
+            # score = max(self.sim_eps, s) * m_score
+            # score = max(self.sim_eps, s) * r
+            # score = max(self.sim_eps, s)
             scores_raw.append(score)
 
         Z = sum(scores_raw) + self.sim_eps
@@ -405,7 +407,7 @@ class ADFedMACClient(Client):
 
     # ------------------------- 聚合 (W-Space Averaging) -------------------------
     @torch.no_grad()
-    def aggregate(self):
+    def aggregate(self, is_even=True):
         """
         【已恢复】
         恢复到您原始的 "普通平均" (W-Space) 聚合。
@@ -434,7 +436,12 @@ class ADFedMACClient(Client):
 
         # 2) 邻居相对权重（和为 1）
         #    (调用我们新的 _compute_peer_weights, 它内部使用 EMD 相似度)
-        neighbor_rel = self._compute_peer_weights(local_cents)  # 长度 n，∑=1
+        if is_even:
+            n = len(self.neighbor_model_weights_buffer)
+            neighbor_rel = [1.0 / n] * n
+        else:
+            neighbor_rel = self._compute_peer_weights()  # 长度 n，∑=1
+
         if len(neighbor_rel) != n:
             return
 

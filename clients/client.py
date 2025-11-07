@@ -80,7 +80,7 @@ class Client(ABC):
 
         # ======= 接收端策略（异步下的缓冲与即时融合）=======
         self.buffer_limit: int = int(hyperparam.get('buffer_limit', 10))
-        self.neighbor_model_weights_buffer: list[Dict[str, torch.Tensor]] = []
+        self.neighbor_model_weights_buffer: list[Any] = []
 
         # 评估时的全局指标记录（保留原字段）
         self.global_metric = self.global_epoch = 0
