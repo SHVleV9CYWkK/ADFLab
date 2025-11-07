@@ -183,25 +183,25 @@ class ADFedMACClient(Client):
 
     def _prepare_maturity_meta(self, cents: Dict[str, torch.Tensor],
                                labels: Dict[str, torch.Tensor]) -> Dict[str, Any]:
-        layer_maturity = {}
-        if not self.mask:
-            self.mask = {k: torch.ones_like(v) for k, v in self.model.state_dict().items()}
-        for layer_key, c_now in cents.items():
-            if c_now is None: continue
-            self._ensure_hist_slot(layer_key)
-            m_now = self.mask.get(layer_key)
-            l_now = labels.get(layer_key)
-            if m_now is None or l_now is None: continue
-            m_now = m_now.to(c_now.device)
-            maturity_vec = self._local_maturity(layer_key, c_now, l_now, m_now)
-            layer_maturity[layer_key] = float(maturity_vec.mean().item())
+        # layer_maturity = {}
+        # if not self.mask:
+        #     self.mask = {k: torch.ones_like(v) for k, v in self.model.state_dict().items()}
+        # for layer_key, c_now in cents.items():
+        #     if c_now is None: continue
+        #     self._ensure_hist_slot(layer_key)
+        #     m_now = self.mask.get(layer_key)
+        #     l_now = labels.get(layer_key)
+        #     if m_now is None or l_now is None: continue
+        #     m_now = m_now.to(c_now.device)
+        #     maturity_vec = self._local_maturity(layer_key, c_now, l_now, m_now)
+        #     layer_maturity[layer_key] = float(maturity_vec.mean().item())
 
         return {
             'version_meta': 'adfedmac_meta_v3',
             'sender_id': self.id,
             'version': int(getattr(self, "local_version", 0)),
             'sender_time': float(getattr(self, "last_update_time", 0.0)),
-            'layer_maturity': layer_maturity
+            # 'layer_maturity': layer_maturity
         }
 
     # ------------------------- 相似度 (S): 1D Wasserstein (EMD) -------------------------
@@ -349,39 +349,41 @@ class ADFedMACClient(Client):
         for (peer_state, peer_cents, peer_labels, peer_meta) in self.neighbor_model_weights_buffer:
 
             # 1. 相似度 (S) - 使用 EMD
-            s = self._neighbor_similarity(
-                local_cents=local_cents,
-                neighbor_cents=peer_cents,
-                local_labels=local_labels,
-                neighbor_labels=peer_labels
-            )
+            # s = self._neighbor_similarity(
+            #     local_cents=local_cents,
+            #     neighbor_cents=peer_cents,
+            #     local_labels=local_labels,
+            #     neighbor_labels=peer_labels
+            # )
 
             # 2. 成熟度 (M)
-            m = 1.0  # 默认
-            if isinstance(peer_meta, dict) and ('layer_maturity' in peer_meta):
-                ms, szs = [], []
-                for layer_key, c_local in local_cents.items():
-                    ml = peer_meta['layer_maturity'].get(layer_key, None)
-                    if ml is None: continue
-                    ms.append(float(ml))
-                    szs.append(self._get_layer_size(layer_key))
-
-                if ms:
-                    ms_t = torch.tensor(ms, device=self.device).float()
-                    sz_t = torch.tensor(szs, device=self.device).float()
-                    m = float((ms_t * (sz_t / (sz_t.sum() + 1e-8))).sum().item())
-
-            m_score = max(self.sim_eps, m) ** self.gamma_maturity
-
-            # 3. 新鲜度 (R)
+            # m = 1.0  # 默认
+            # if isinstance(peer_meta, dict) and ('layer_maturity' in peer_meta):
+            #     ms, szs = [], []
+            #     for layer_key, c_local in local_cents.items():
+            #         ml = peer_meta['layer_maturity'].get(layer_key, None)
+            #         if ml is None: continue
+            #         ms.append(float(ml))
+            #         szs.append(self._get_layer_size(layer_key))
+            #
+            #     if ms:
+            #         ms_t = torch.tensor(ms, device=self.device).float()
+            #         sz_t = torch.tensor(szs, device=self.device).float()
+            #         m = float((ms_t * (sz_t / (sz_t.sum() + 1e-8))).sum().item())
+            #
+            # m_score = max(self.sim_eps, m) ** self.gamma_maturity
+            #
+            # # 3. 新鲜度 (R)
             sender_time = float(peer_meta.get('sender_time', t_now)) if isinstance(peer_meta, dict) else t_now
             r = math.exp(- self.lambda_time * max(0.0, t_now - sender_time))
 
             # 最终得分
-            score = max(self.sim_eps, s) * m_score * r
+            # score = max(self.sim_eps, s) * m_score * r
             # score = max(self.sim_eps, s) * m_score
             # score = max(self.sim_eps, s) * r
             # score = max(self.sim_eps, s)
+            # score = m_score
+            score = r
             scores_raw.append(score)
 
         Z = sum(scores_raw) + self.sim_eps
@@ -407,7 +409,7 @@ class ADFedMACClient(Client):
 
     # ------------------------- 聚合 (W-Space Averaging) -------------------------
     @torch.no_grad()
-    def aggregate(self, is_even=True):
+    def aggregate(self, is_even=False):
         """
         【已恢复】
         恢复到您原始的 "普通平均" (W-Space) 聚合。
@@ -436,8 +438,8 @@ class ADFedMACClient(Client):
 
         # 2) 邻居相对权重（和为 1）
         #    (调用我们新的 _compute_peer_weights, 它内部使用 EMD 相似度)
+        n = len(self.neighbor_model_weights_buffer)
         if is_even:
-            n = len(self.neighbor_model_weights_buffer)
             neighbor_rel = [1.0 / n] * n
         else:
             neighbor_rel = self._compute_peer_weights()  # 长度 n，∑=1

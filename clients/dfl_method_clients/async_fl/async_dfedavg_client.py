@@ -24,22 +24,35 @@ class AsyncDFedAvgClient(Client):
         if len(self.neighbor_model_weights_buffer) == 0:
             return  # 没有邻居更新就不动
 
-        neighbor_weights_state = [neighbor[0] for neighbor in self.neighbor_model_weights_buffer]
+        n = len(self.neighbor_model_weights_buffer)
+        neighbor_rel = [1.0 / n] * n
+        neighbor_states = [tpl[0] for tpl in self.neighbor_model_weights_buffer]
+        keys = set(neighbor_states[0].keys())
 
-        # 取当前本地模型（作为被平均的第一项）
-        current = {k: v.detach().clone().to(self.device) for k, v in self.model.state_dict().items()}
-        count = 1 + len(self.neighbor_model_weights_buffer)
+        local_w = 1.0 / (n + 1.0)
+        scale_neighbors = 1.0 - local_w
+        neighbor_w = [w * scale_neighbors for w in neighbor_rel]
 
-        # 累加邻居
-        for sd in neighbor_weights_state:
-            for k in current.keys():
-                current[k] += sd[k].to(self.device)
+        # 4) 计算加权均值（邻居 + 本地）
+        avg = {}
+        local_state_dict = self.model.state_dict()
 
-        # 做平均并加载回模型
-        for k in current.keys():
-            current[k] /= float(count)
+        # 先邻居
+        for k in keys:
+            acc = None
+            for st, w in zip(neighbor_states, neighbor_w):
+                if k not in st: continue  # 安全检查
+                t = st[k].to(self.device)
+                acc = t.mul(w) if acc is None else acc.add(t, alpha=w)
 
-        self.model.load_state_dict(current)
+            if k in local_state_dict and acc is not None:
+                t_local = local_state_dict[k].to(self.device)
+                acc = acc.add(t_local, alpha=local_w)
+                avg[k] = acc
+            elif k in local_state_dict:  # 仅有本地
+                avg[k] = local_state_dict[k].to(self.device)
+
+        self.model.load_state_dict(avg)
 
     # ---- 初始化模型 ----
     def set_init_model(self, model):
