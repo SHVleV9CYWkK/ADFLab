@@ -41,22 +41,25 @@ class ADFedMACClient(Client):
         self.n_clusters: int = int(hp.get('n_clusters', 16))
         self.epochs: int = int(hp.get('epochs', 1))
 
-        # 相似度超参
-        self.beta_num: float = float(hp.get('beta_num', 2.0))
-
-        # ... (成熟度, 新鲜度, 训练超参保持不变) ...
+        # ... (成熟度, 训练超参保持不变) ...
+        self.use_maturity: bool = bool(hp.get("use_maturity", False))
         self.maturity_tau: float = float(hp.get('maturity_tau', 10.0))
         self.maturity_eps: float = float(hp.get('maturity_eps', 1e-5))
         self.beta_drift: float = float(hp.get('beta_drift', 2.0))
         self.beta_invar: float = float(hp.get('beta_invar', 1.0))
         self.beta_mask: float = float(hp.get('beta_mask', 2.0))
         self.history_maxlen: int = int(hp.get('history_maxlen', 20))
-        self.lambda_time: float = float(hp.get('lambda_time', 0.05))
         self.gamma_maturity: float = float(hp.get('gamma_maturity', 1.0))
         self.sim_eps: float = 1e-8
         self.apply_mask_every_epoch: bool = bool(hp.get('apply_mask_every_epoch', True))
+        self.ps_mass: float = 1.0
 
-    # ------------------------- 工具：排序/方差 -------------------------
+        self.ps_mass: float = 1.0  # push-sum 质量，后面会被成熟度初始化覆盖
+        self.node_importance: float = 1.0  # 由成熟度得到的节点重要性
+        self.ps_mass_initialized: bool = False  # 是否已经用成熟度初始化过 ps_mass
+
+
+        # ------------------------- 工具：排序/方差 -------------------------
     # ... ( _sort_centroids_and_remap, _cluster_intra_var 保持不变) ...
     @staticmethod
     def _sort_centroids_and_remap(c1d: torch.Tensor, lbl: torch.Tensor):
@@ -81,7 +84,6 @@ class ADFedMACClient(Client):
         return vars_out + eps
 
     # ------------------------- 历史缓存（成熟度） -------------------------
-    # ... ( _ensure_hist_slot, _update_local_history 保持不变) ...
     def _ensure_hist_slot(self, layer: str):
         if layer not in self._local_hist:
             self._local_hist[layer] = deque(maxlen=self.history_maxlen)
@@ -97,7 +99,6 @@ class ADFedMACClient(Client):
             self._local_mask_hist[layer].append(m.detach())
 
     # ------------------------- 聚类 + 掩码 -------------------------
-    # ... ( _cluster_and_prune_model_weights, _apply_prune_mask_inplace 保持不变) ...
     def _cluster_and_prune_model_weights(self):
         clustered: Dict[str, torch.Tensor] = {}
         mask: Dict[str, torch.Tensor] = {}
@@ -181,82 +182,76 @@ class ADFedMACClient(Client):
         stab = self._stability_scores(layer_key, cents_now, labels_now, mask_now)
         return lam * stab
 
+    def _compute_node_maturity(self,
+                               cents: Dict[str, torch.Tensor],
+                               labels: Dict[str, torch.Tensor]) -> float:
+        layer_ms = []
+        layer_sizes = []
+
+        # 确保 mask 有东西
+        if not self.mask:
+            self.mask = {k: torch.ones_like(v, dtype=torch.bool, device=v.device)
+                         for k, v in self.model.state_dict().items()}
+
+        for layer_key, c_now in cents.items():
+            if c_now is None:
+                continue
+            self._ensure_hist_slot(layer_key)
+
+            m_now = self.mask.get(layer_key, None)
+            l_now = labels.get(layer_key, None)
+            if m_now is None or l_now is None:
+                continue
+
+            c_now = c_now.to(self.device)
+            m_now = m_now.to(self.device)
+            l_now = l_now.to(self.device)
+
+            maturity_vec = self._local_maturity(layer_key, c_now, l_now, m_now)
+            # 这一层的平均成熟度
+            m_layer = float(maturity_vec.mean().item())
+            layer_ms.append(m_layer)
+            layer_sizes.append(self._get_layer_size(layer_key))
+
+        if not layer_ms:
+            # 没有历史/信息时，退化为 1.0
+            return 1.0
+
+        ms_t = torch.tensor(layer_ms, device=self.device).float()
+        sz_t = torch.tensor(layer_sizes, device=self.device).float()
+        weights = sz_t / (sz_t.sum() + 1e-8)
+        M = float((ms_t * weights).sum().item())
+        return M
+
     def _prepare_maturity_meta(self, cents: Dict[str, torch.Tensor],
                                labels: Dict[str, torch.Tensor]) -> Dict[str, Any]:
-        # layer_maturity = {}
-        # if not self.mask:
-        #     self.mask = {k: torch.ones_like(v) for k, v in self.model.state_dict().items()}
-        # for layer_key, c_now in cents.items():
-        #     if c_now is None: continue
-        #     self._ensure_hist_slot(layer_key)
-        #     m_now = self.mask.get(layer_key)
-        #     l_now = labels.get(layer_key)
-        #     if m_now is None or l_now is None: continue
-        #     m_now = m_now.to(c_now.device)
-        #     maturity_vec = self._local_maturity(layer_key, c_now, l_now, m_now)
-        #     layer_maturity[layer_key] = float(maturity_vec.mean().item())
+        # 1) 先基于当前 cluster 结果算“节点成熟度” M_i
+        node_maturity = self._compute_node_maturity(cents, labels)
+        # 防止数值问题，做个裁剪
+        node_maturity = max(self.maturity_eps, float(node_maturity))
+
+        # 2) 把成熟度映射到节点重要性 c_i
+        importance = (node_maturity ** self.gamma_maturity)
+
+        # 3) 用成熟度初始化 push-sum 质量（只做一次，后续轮次不再重复）
+        if not self.ps_mass_initialized:
+            self.node_importance = importance
+            self.ps_mass = float(self.node_importance)
+            self.ps_mass_initialized = True
+
+        # 4) 正常做 push-sum 的等分（这一段是你原来的逻辑）
+        d_out = self.k_push + 1  # +1 表示“留给自己”的那一份
+        share = float(self.ps_mass) / float(d_out)
+        # 重置本地质量为自己保留的一份
+        self.ps_mass = share
 
         return {
             'version_meta': 'adfedmac_meta_v3',
             'sender_id': self.id,
-            'version': int(getattr(self, "local_version", 0)),
-            'sender_time': float(getattr(self, "last_update_time", 0.0)),
-            # 'layer_maturity': layer_maturity
+            'version': self.local_version,
+            'sender_time': self.last_update_time,
+            "ps_mass_share": share,
         }
-
-    # ------------------------- 相似度 (S): 1D Wasserstein (EMD) -------------------------
-
-    @staticmethod
-    def _torch_1d_wasserstein(
-            C_a: torch.Tensor, C_b: torch.Tensor, a: torch.Tensor, b: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        计算两个 1D 离散分布之间的 Wasserstein-1 距离。
-        C_a, C_b: 质心值 (values) [K, 1]
-        a, b: 簇占比 (weights/probabilities) [K]
-
-        基于 W_1(F, G) = integral |CDF_F(x) - CDF_G(x)| dx
-        """
-        # 1. 确保输入正确
-        C_a = C_a.view(-1)
-        C_b = C_b.view(-1)
-
-        # 2. 对 A 排序
-        C_a_sorted, idx_a = torch.sort(C_a)
-        a_sorted = a[idx_a]
-
-        # 3. 对 B 排序
-        C_b_sorted, idx_b = torch.sort(C_b)
-        b_sorted = b[idx_b]
-
-        # 4. 获取所有值点，并排序去重
-        all_values = torch.cat([C_a_sorted, C_b_sorted])
-        all_values_sorted, _ = torch.sort(all_values)
-
-        # 5. 计算 deltas (dx)
-        # 我们计算点 x_i 和 x_i+1 之间的距离
-        deltas = all_values_sorted[1:] - all_values_sorted[:-1]  # [2K-1]
-
-        # 6. 计算 CDF 在 x_i 的值 (在 deltas 之前)
-        # cdf(x) = sum(w_i for v_i <= x)
-
-        # 6a. A 的 CDF
-        cdf_a_vals = torch.cumsum(a_sorted, dim=0)  # [K]
-        # 找到 all_values_sorted[:-1] 在 C_a_sorted 中的位置
-        indices_a = torch.searchsorted(C_a_sorted, all_values_sorted[:-1], right=True)  # [2K-1]
-        # cdf_a_at_x[j] = cdf_a_vals[indices_a[j]-1]
-        cdf_a_at_x = cdf_a_vals[torch.clamp(indices_a - 1, 0)]  # [2K-1]
-        cdf_a_at_x[indices_a == 0] = 0.0  # 处理边界
-
-        # 6b. B 的 CDF
-        cdf_b_vals = torch.cumsum(b_sorted, dim=0)  # [K]
-        indices_b = torch.searchsorted(C_b_sorted, all_values_sorted[:-1], right=True)
-        cdf_b_at_x = cdf_b_vals[torch.clamp(indices_b - 1, 0)]
-        cdf_b_at_x[indices_b == 0] = 0.0
-
-        # 7. 计算 W1 = sum |CDF_A(x_i) - CDF_B(x_i)| * dx_i
-        dist = torch.sum(torch.abs(cdf_a_at_x - cdf_b_at_x) * deltas)
-        return dist
 
     def _get_layer_size(self, layer_key: str) -> int:
         m = self.mask.get(layer_key, None)
@@ -266,133 +261,8 @@ class ADFedMACClient(Client):
             return int(self.cluster_model[2][layer_key].numel())
         return int(self.model.state_dict()[layer_key].numel())
 
-    def _get_cluster_ratios(self,
-                            labels: Dict[str, torch.Tensor] | None,
-                            layer_key: str,
-                            K: int,
-                            device: torch.device
-                            ) -> torch.Tensor:
-        if (labels is not None) and (labels.get(layer_key) is not None):
-            l = labels[layer_key].to(device).view(-1)
-            counts = torch.bincount(l, minlength=K).float()
-        else:
-            counts = torch.ones(K, device=device)
-        return counts / (counts.sum() + 1e-8)
-
-    def _neighbor_similarity(self,
-                             local_cents: Dict[str, torch.Tensor],
-                             neighbor_cents: Dict[str, torch.Tensor],
-                             local_labels: Dict[str, torch.Tensor] | None,
-                             neighbor_labels: Dict[str, torch.Tensor] | None
-                             ) -> float:
-        """
-        【重写】
-        使用 1D Wasserstein (EMD) 距离计算相似度 S
-        """
-        per_d, per_sz = [], []  # 存储每层的距离(d)和规模(sz)
-
-        for layer_key, C in local_cents.items():
-            C_peer = neighbor_cents.get(layer_key, None)
-            if C is None or C_peer is None:
-                continue
-
-            C = C.view(self.n_clusters, -1).float().to(self.device)
-            C_peer = C_peer.view(self.n_clusters, -1).float().to(self.device)
-            K = C.shape[0]
-
-            # 簇占比 a（本地），b（邻居）
-            a = self._get_cluster_ratios(local_labels, layer_key, K, self.device)
-            b = self._get_cluster_ratios(neighbor_labels, layer_key, K, self.device)
-
-            # 计算 EMD 距离
-            d_L = self._torch_1d_wasserstein(C, C_peer, a, b)
-
-            per_d.append(d_L)
-            per_sz.append(self._get_layer_size(layer_key))
-
-        if len(per_d) == 0:
-            return 0.5  # 默认
-
-        d_stack = torch.stack(per_d).to(self.device)
-        sz_stack = torch.tensor(per_sz, device=self.device, dtype=torch.float)
-        w_stack = sz_stack / (sz_stack.sum() + self.sim_eps)
-
-        # 归一化距离：使用所有层距离的中位数作为尺度
-        scale = d_stack.median() + self.sim_eps
-
-        # 将距离转换为相似度 (S)
-        # s_layers = exp(-beta * d_layer / scale)
-        s_layers = torch.exp(- self.beta_num * d_stack / scale)
-
-        # 按层规模加权平均相似度
-        s_scalar = float((s_layers * w_stack).sum().item())
-        return s_scalar
-
-    # ------------------------- 邻居权重（S × M^γ × R）-------------------------
-    @torch.no_grad()
-    def _compute_peer_weights(self) -> List[float]:
-        """
-        【已更新】
-        调用新的 EMD _neighbor_similarity，不再返回 A 矩阵
-        """
-        if len(self.neighbor_model_weights_buffer) == 0:
-            return []
-
-        # 确保本地 cluster_model 存在
-        if self.cluster_model is None:
-            self.cluster_model = self._cluster_and_prune_model_weights()
-        _, local_cents, local_labels = self.cluster_model
-
-        t_now = float(getattr(self, "last_update_time", 0.0))
-        scores_raw = []
-
-        for (peer_state, peer_cents, peer_labels, peer_meta) in self.neighbor_model_weights_buffer:
-
-            # 1. 相似度 (S) - 使用 EMD
-            # s = self._neighbor_similarity(
-            #     local_cents=local_cents,
-            #     neighbor_cents=peer_cents,
-            #     local_labels=local_labels,
-            #     neighbor_labels=peer_labels
-            # )
-
-            # 2. 成熟度 (M)
-            # m = 1.0  # 默认
-            # if isinstance(peer_meta, dict) and ('layer_maturity' in peer_meta):
-            #     ms, szs = [], []
-            #     for layer_key, c_local in local_cents.items():
-            #         ml = peer_meta['layer_maturity'].get(layer_key, None)
-            #         if ml is None: continue
-            #         ms.append(float(ml))
-            #         szs.append(self._get_layer_size(layer_key))
-            #
-            #     if ms:
-            #         ms_t = torch.tensor(ms, device=self.device).float()
-            #         sz_t = torch.tensor(szs, device=self.device).float()
-            #         m = float((ms_t * (sz_t / (sz_t.sum() + 1e-8))).sum().item())
-            #
-            # m_score = max(self.sim_eps, m) ** self.gamma_maturity
-            #
-            # # 3. 新鲜度 (R)
-            sender_time = float(peer_meta.get('sender_time', t_now)) if isinstance(peer_meta, dict) else t_now
-            r = math.exp(- self.lambda_time * max(0.0, t_now - sender_time))
-
-            # 最终得分
-            # score = max(self.sim_eps, s) * m_score * r
-            # score = max(self.sim_eps, s) * m_score
-            # score = max(self.sim_eps, s) * r
-            # score = max(self.sim_eps, s)
-            # score = m_score
-            score = r
-            scores_raw.append(score)
-
-        Z = sum(scores_raw) + self.sim_eps
-        rel_weights = [s / Z for s in scores_raw]
-        return rel_weights
-
     # ------------------------- 训练 -------------------------
     def _local_train(self):
-        # ... ( _local_train 保持不变) ...
         if self.client_train_loader is None:
             raise RuntimeError("DataLoader not initialized; ensure init_client() on join.")
         self.model.train()
@@ -409,14 +279,8 @@ class ADFedMACClient(Client):
 
     # ------------------------- 聚合 (W-Space Averaging) -------------------------
     @torch.no_grad()
-    def aggregate(self, is_even=False):
-        """
-        【已恢复】
-        恢复到您原始的 "普通平均" (W-Space) 聚合。
-        此方法在数学上是稳健的，它聚合的是 "近似模型" 的值。
-        """
-        n = len(self.neighbor_model_weights_buffer)
-        if n == 0:
+    def aggregate(self):
+        if len(self.neighbor_model_weights_buffer) == 0:
             return  # 无邻居或无训练就不聚合
 
         # 启动逻辑
@@ -431,55 +295,58 @@ class ADFedMACClient(Client):
                 avg_state[k] = acc
             self.model.load_state_dict(avg_state)
             self.cluster_model = self._cluster_and_prune_model_weights()
+
+            recv_mass = sum(float(tpl[-1]['ps_mass_share']) for tpl in self.neighbor_model_weights_buffer
+                            if isinstance(tpl, tuple) and len(tpl) >= 2)
+            self.ps_mass = float(self.ps_mass) + float(recv_mass)
+            self.neighbor_model_weights_buffer.clear()
             return
 
-        # 1) 本地最新质心（用于计算S）
-        _, local_cents, _ = self.cluster_model
+        neighbor_states = []
+        neighbor_masses = []
+        for tpl in self.neighbor_model_weights_buffer:
+            neighbor_states.append(tpl[0])
+            if len(tpl) >= 2:
+                neighbor_masses.append(float(tpl[-1]['ps_mass_share']))
+            else:
+                neighbor_masses.append(0.0)
 
-        # 2) 邻居相对权重（和为 1）
-        #    (调用我们新的 _compute_peer_weights, 它内部使用 EMD 相似度)
-        n = len(self.neighbor_model_weights_buffer)
-        if is_even:
-            neighbor_rel = [1.0 / n] * n
-        else:
-            neighbor_rel = self._compute_peer_weights()  # 长度 n，∑=1
-
-        if len(neighbor_rel) != n:
-            return
-
-        neighbor_states = [tpl[0] for tpl in self.neighbor_model_weights_buffer]
         keys = set(neighbor_states[0].keys())
+        local_mass = float(self.ps_mass)
 
-        # 3) 动态自锚点
-        local_w = 1.0 / (n + 1.0)  # 本地 1/(n+1)
-        scale_neighbors = 1.0 - local_w  # 邻居总权重
-        neighbor_w = [w * scale_neighbors for w in neighbor_rel]  # 仍然 ∑=1-local_w
+        total_mass = local_mass + float(sum(neighbor_masses))
+        if total_mass <= 0:
+            # 极端兜底：退化成均匀平均
+            total_mass = 1.0
+            local_mass = 1.0 / (len(neighbor_states) + 1.0)
+            neighbor_masses = [1.0 / (len(neighbor_states) + 1.0)] * len(neighbor_states)
 
-        # 4) 计算加权均值（邻居 + 本地）
         avg = {}
         local_state_dict = self.model.state_dict()
-
-        # 先邻居
         for k in keys:
             acc = None
-            for st, w in zip(neighbor_states, neighbor_w):
-                if k not in st: continue  # 安全检查
+            # 邻居累加：每个张量乘以该邻居的 ps_mass 再加和
+            for st, m in zip(neighbor_states, neighbor_masses):
+                if k not in st:
+                    continue
                 t = st[k].to(self.device)
-                acc = t.mul(w) if acc is None else acc.add(t, alpha=w)
-
-            # 再加本地锚点
-            if k in local_state_dict and acc is not None:
+                acc = t.mul(m) if acc is None else acc.add(t, alpha=m)
+            # 再加本地（带本地质量）
+            if k in local_state_dict:
                 t_local = local_state_dict[k].to(self.device)
-                acc = acc.add(t_local, alpha=local_w)
-                avg[k] = acc
-            elif k in local_state_dict:  # 仅有本地
-                avg[k] = local_state_dict[k].to(self.device)
+                if acc is None:
+                    acc = t_local.mul(local_mass)
+                else:
+                    acc = acc.add(t_local, alpha=local_mass)
+            # 最后除以总质量
+            avg[k] = acc.div(total_mass)
+        self.ps_mass = float(total_mass)
 
         self.model.load_state_dict(avg)
+        self.neighbor_model_weights_buffer.clear()
 
     # ------------------------- 训练总流程 -------------------------
     def train(self):
-        # ... ( train 保持不变) ...
         self._local_train()
         self.cluster_model = self._cluster_and_prune_model_weights()
 
@@ -488,10 +355,6 @@ class ADFedMACClient(Client):
         self.model = deepcopy(model).to(self.device)
 
     def send_model(self):
-        """
-        【已更新】
-        发送 v3 meta (包含成熟度)
-        """
         if self.cluster_model is None:
             clustered_state_dict, cents, labels = self._cluster_and_prune_model_weights()
             self.cluster_model = (clustered_state_dict, cents, labels)

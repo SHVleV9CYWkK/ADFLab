@@ -197,13 +197,6 @@ class AsyncCoordinator:
                 client_results[cid] = metrics
                 for k, v in metrics.items():
                     agg[k] = agg.get(k, 0.0) + float(v)
-            overall = {k: (v / len(online_ids)) for k, v in agg.items()}
-
-            # 可在此处输出/记录 overall 与 client_results（留给上层调用者）
-
-            # 学习率调度（基于 last_accuracy）
-            for cid in online_ids:
-                self.all_clients[cid].update_lr()
 
         # 调度下一次 EVAL_TICK\
         print(f"EVAL_TICK self.now: {self.now}, self.eval_interval:{self.eval_interval}， Total:{self.now + self.eval_interval}")

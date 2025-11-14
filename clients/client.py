@@ -45,6 +45,7 @@ class Client(ABC):
         self.epochs = int(hyperparam.get('local_epochs', 1))
         self.scheduler_name = hyperparam.get('scheduler_name', 'none')
         self.n_rounds = int(hyperparam.get('n_rounds', 0))
+        self.k_push = self.k_push = int(hyperparam.get('k_push', 10))
         self.lr_scheduler = None
         self.last_accuracy: Optional[torch.Tensor] = None
 
@@ -171,7 +172,7 @@ class Client(ABC):
                 "sender_id": self.id,
                 "version": self.local_version,
                 "sender_time": self.last_update_time,
-                "model_nbytes": self._model_num_bytes()
+                # "model_nbytes": self._model_num_bytes()
         }
         return state, meta
 
