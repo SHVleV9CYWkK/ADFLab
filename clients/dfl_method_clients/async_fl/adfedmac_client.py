@@ -1,28 +1,16 @@
 from __future__ import annotations
 from collections import deque
 from copy import deepcopy
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
-
-import math
-
-from networkx.classes import neighbors
 
 from clients.client import Client
 from utils.kmeans import TorchKMeans
 
 
 class ADFedMACClient(Client):
-    """
-    ADFedMAC v3 (W-Space 聚合 + EMD 相似度):
-    - 聚合方式: W-Space "普通平均" (已恢复)
-    - 相似度 (S): 1D Wasserstein (EMD) 距离 (新), 对 K-Means 不稳定更鲁棒
-    - 成熟度 (M): (SWAG 精度 × 稳定性) (保留)
-    - 权重 (W): (S × M^γ × R)
-    """
-
     # ------------------------- 初始化 -------------------------
     def __init__(self, client_id, dataset_index, full_dataset, hyperparam, device):
         hp = dict(hyperparam)
@@ -41,26 +29,11 @@ class ADFedMACClient(Client):
         self.n_clusters: int = int(hp.get('n_clusters', 16))
         self.epochs: int = int(hp.get('epochs', 1))
 
-        # ... (成熟度, 训练超参保持不变) ...
-        self.use_maturity: bool = bool(hp.get("use_maturity", False))
-        self.maturity_tau: float = float(hp.get('maturity_tau', 10.0))
-        self.maturity_eps: float = float(hp.get('maturity_eps', 1e-5))
-        self.beta_drift: float = float(hp.get('beta_drift', 2.0))
-        self.beta_invar: float = float(hp.get('beta_invar', 1.0))
-        self.beta_mask: float = float(hp.get('beta_mask', 2.0))
-        self.history_maxlen: int = int(hp.get('history_maxlen', 20))
         self.gamma_maturity: float = float(hp.get('gamma_maturity', 1.0))
         self.sim_eps: float = 1e-8
         self.apply_mask_every_epoch: bool = bool(hp.get('apply_mask_every_epoch', True))
         self.ps_mass: float = 1.0
 
-        self.ps_mass: float = 1.0  # push-sum 质量，后面会被成熟度初始化覆盖
-        self.node_importance: float = 1.0  # 由成熟度得到的节点重要性
-        self.ps_mass_initialized: bool = False  # 是否已经用成熟度初始化过 ps_mass
-
-
-        # ------------------------- 工具：排序/方差 -------------------------
-    # ... ( _sort_centroids_and_remap, _cluster_intra_var 保持不变) ...
     @staticmethod
     def _sort_centroids_and_remap(c1d: torch.Tensor, lbl: torch.Tensor):
         c = c1d.view(-1).detach()
@@ -71,34 +44,6 @@ class ADFedMACClient(Client):
         new_labels = old2new[lbl]
         return sorted_c, new_labels
 
-    @staticmethod
-    def _cluster_intra_var(flat_w: torch.Tensor, labels: torch.Tensor, K: int, eps: float = 1e-8) -> torch.Tensor:
-        vars_out = flat_w.new_zeros(K, 1)
-        for k in range(K):
-            idx = (labels == k)
-            if idx.any():
-                w = flat_w[idx].view(-1)
-                vars_out[k, 0] = torch.var(w, unbiased=False)
-            else:
-                vars_out[k, 0] = eps
-        return vars_out + eps
-
-    # ------------------------- 历史缓存（成熟度） -------------------------
-    def _ensure_hist_slot(self, layer: str):
-        if layer not in self._local_hist:
-            self._local_hist[layer] = deque(maxlen=self.history_maxlen)
-        if layer not in self._local_mask_hist:
-            self._local_mask_hist[layer] = deque(maxlen=self.history_maxlen)
-
-    def _update_local_history(self, centroids: Dict[str, torch.Tensor], mask: Dict[str, torch.Tensor]):
-        for layer, c in centroids.items():
-            self._ensure_hist_slot(layer)
-            self._local_hist[layer].append(c.detach())
-        for layer, m in mask.items():
-            self._ensure_hist_slot(layer)
-            self._local_mask_hist[layer].append(m.detach())
-
-    # ------------------------- 聚类 + 掩码 -------------------------
     def _cluster_and_prune_model_weights(self):
         clustered: Dict[str, torch.Tensor] = {}
         mask: Dict[str, torch.Tensor] = {}
@@ -127,7 +72,6 @@ class ADFedMACClient(Client):
                 mask[key] = torch.ones_like(w, dtype=torch.bool, device=w.device)
 
         self.mask = mask
-        self._update_local_history(cents, mask)
         return clustered, cents, labels
 
     def _apply_prune_mask_inplace(self):
@@ -136,113 +80,10 @@ class ADFedMACClient(Client):
                 if name in self.mask:
                     p.mul_(self.mask[name].to(p.device))
 
-    # ------------------------- 成熟度 (M) -------------------------
-    def _c_swag_precision(self, hist: deque) -> torch.Tensor:
-        last = hist[-1]
-        if len(hist) < 2:
-            return last.new_zeros(last.shape[0], 1)
-        stack = torch.stack(list(hist), dim=0)
-        mu = stack.mean(dim=0)
-        var = ((stack - mu) ** 2).mean(dim=0)
-        cv = var / (mu.abs() + 1e-4)
-        lam = torch.exp(-self.maturity_tau * cv).clamp_min(self.maturity_eps)
-        return lam
-
-    def _stability_scores(self, layer_key: str,
-                          cents_now: torch.Tensor,
-                          labels_now: torch.Tensor,
-                          mask_now: torch.Tensor) -> torch.Tensor:
-        dev = cents_now.device
-        hist = self._local_hist.get(layer_key, [])
-        if len(hist) >= 3:
-            c_t = hist[-1].to(dev)
-            c_t1 = hist[-2].to(dev)
-            c_t2 = hist[-3].to(dev)
-            accel = torch.abs((c_t - c_t1) - (c_t1 - c_t2))  # 加速度
-        else:
-            accel = torch.zeros_like(cents_now)
-        flat_w = self.model.state_dict()[layer_key].to(dev).view(-1, 1).detach()
-        K = cents_now.shape[0]
-        invar = self._cluster_intra_var(flat_w, labels_now, K, eps=self.maturity_eps)
-        if len(self._local_mask_hist.get(layer_key, [])) >= 2:
-            prev_m = self._local_mask_hist[layer_key][-2].to(dev)
-            flips = (prev_m ^ mask_now).float().mean()
-        else:
-            flips = torch.tensor(0.0, device=dev)
-        stab = torch.exp(- self.beta_drift * accel - self.beta_invar * invar - self.beta_mask * flips)
-        return stab
-
-    def _local_maturity(self, layer_key: str,
-                        cents_now: torch.Tensor,
-                        labels_now: torch.Tensor,
-                        mask_now: torch.Tensor) -> torch.Tensor:
-        if layer_key not in self._local_hist:
-            return torch.zeros_like(cents_now)
-        lam = self._c_swag_precision(self._local_hist[layer_key]).to(cents_now.device)
-        stab = self._stability_scores(layer_key, cents_now, labels_now, mask_now)
-        return lam * stab
-
-    def _compute_node_maturity(self,
-                               cents: Dict[str, torch.Tensor],
-                               labels: Dict[str, torch.Tensor]) -> float:
-        layer_ms = []
-        layer_sizes = []
-
-        # 确保 mask 有东西
-        if not self.mask:
-            self.mask = {k: torch.ones_like(v, dtype=torch.bool, device=v.device)
-                         for k, v in self.model.state_dict().items()}
-
-        for layer_key, c_now in cents.items():
-            if c_now is None:
-                continue
-            self._ensure_hist_slot(layer_key)
-
-            m_now = self.mask.get(layer_key, None)
-            l_now = labels.get(layer_key, None)
-            if m_now is None or l_now is None:
-                continue
-
-            c_now = c_now.to(self.device)
-            m_now = m_now.to(self.device)
-            l_now = l_now.to(self.device)
-
-            maturity_vec = self._local_maturity(layer_key, c_now, l_now, m_now)
-            # 这一层的平均成熟度
-            m_layer = float(maturity_vec.mean().item())
-            layer_ms.append(m_layer)
-            layer_sizes.append(self._get_layer_size(layer_key))
-
-        if not layer_ms:
-            # 没有历史/信息时，退化为 1.0
-            return 1.0
-
-        ms_t = torch.tensor(layer_ms, device=self.device).float()
-        sz_t = torch.tensor(layer_sizes, device=self.device).float()
-        weights = sz_t / (sz_t.sum() + 1e-8)
-        M = float((ms_t * weights).sum().item())
-        return M
-
     def _prepare_maturity_meta(self, cents: Dict[str, torch.Tensor],
                                labels: Dict[str, torch.Tensor]) -> Dict[str, Any]:
-        # 1) 先基于当前 cluster 结果算“节点成熟度” M_i
-        node_maturity = self._compute_node_maturity(cents, labels)
-        # 防止数值问题，做个裁剪
-        node_maturity = max(self.maturity_eps, float(node_maturity))
-
-        # 2) 把成熟度映射到节点重要性 c_i
-        importance = (node_maturity ** self.gamma_maturity)
-
-        # 3) 用成熟度初始化 push-sum 质量（只做一次，后续轮次不再重复）
-        if not self.ps_mass_initialized:
-            self.node_importance = importance
-            self.ps_mass = float(self.node_importance)
-            self.ps_mass_initialized = True
-
-        # 4) 正常做 push-sum 的等分（这一段是你原来的逻辑）
-        d_out = self.k_push + 1  # +1 表示“留给自己”的那一份
+        d_out = self.k_push + 1
         share = float(self.ps_mass) / float(d_out)
-        # 重置本地质量为自己保留的一份
         self.ps_mass = share
 
         return {
@@ -277,7 +118,7 @@ class ADFedMACClient(Client):
                 loss.backward()
                 self.optimizer.step()
 
-    # ------------------------- 聚合 (W-Space Averaging) -------------------------
+    # ------------------------- 聚合 -------------------------
     @torch.no_grad()
     def aggregate(self):
         if len(self.neighbor_model_weights_buffer) == 0:
