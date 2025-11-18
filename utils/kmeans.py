@@ -4,7 +4,7 @@ from torch import Tensor
 class TorchKMeans:
     def __init__(self, n_clusters=8, n_init=1, max_iter=300, tol=5e-3,
                  batch_size=None, is_sparse=False, use_minibatch=False,
-                 dtype=None, seed=None):
+                 dtype=None, seed=None, init_centroids: Tensor | None = None):
         self.n_clusters = n_clusters
         self.n_init = n_init
         self.max_iter = max_iter
@@ -14,6 +14,10 @@ class TorchKMeans:
         self.use_minibatch = use_minibatch
         self.dtype = dtype
         self.seed = seed
+
+        # NEW: 外部提供的初始质心，用于“warm start / global codebook init”
+        # 形状期望为 [K, D]（或者兼容 reshaping）
+        self.init_centroids: Tensor | None = init_centroids
 
         self.centroids: Tensor | None = None
         self.labels_: Tensor | None = None
@@ -35,8 +39,29 @@ class TorchKMeans:
         best_loss = float('inf')
         best_centroids = None
 
-        for _ in range(self.n_init):
-            centroids = self._initialize_centroids_kpp(X)
+        # === NEW: 处理外部初始化的质心（作为 KMeans init） ===
+        use_custom_init = False
+        custom_init = None
+        if self.init_centroids is not None:
+            custom_init = self.init_centroids.to(device)
+            # 尝试 reshape 成 [K, D]（例如传进来 [K,1] 或 [K]）
+            if custom_init.dim() == 1:
+                custom_init = custom_init.view(K, -1)
+            elif custom_init.dim() == 2 and custom_init.size(0) == K and custom_init.size(1) != D:
+                # 如果列数不匹配，尝试在最后一维上 reshape（你的场景中基本是 D=1）
+                custom_init = custom_init.view(K, D)
+            # 最终形状必须与 [K, D] 一致，否则放弃自定义 init
+            if custom_init.shape == (K, D):
+                use_custom_init = True
+
+        # 如果使用自定义 init，我们通常只跑一次 n_init=1，比多次随机重启更合理
+        n_init = 1 if use_custom_init else self.n_init
+
+        for _ in range(n_init):
+            if use_custom_init:
+                centroids = custom_init.clone()
+            else:
+                centroids = self._initialize_centroids_random(X)
 
             # Minibatch 累计器（若启用）
             if self.use_minibatch and self.batch_size:
@@ -80,7 +105,7 @@ class TorchKMeans:
                         counts[empty] = 1
                     new_centroids = sums / counts.unsqueeze(1)
 
-                # is_sparse 的“零中心”兼容（如果需要保留）
+                # is_sparse 的“零中心”兼容
                 if self.is_sparse:
                     new_centroids[0].zero_()
 
@@ -140,6 +165,41 @@ class TorchKMeans:
 
         return torch.stack(centroids, dim=0).to(device)
 
+    @torch.no_grad()
+    def _initialize_centroids_random(self, X: Tensor) -> Tensor:
+        """
+        随机初始化质心：
+        - dense 情况：从 X 中随机采样 K 个样本
+        - sparse 情况：第一个中心固定为 0，其余从 X 中随机采样
+        """
+        N, D = X.shape
+        device = X.device
+        K = self.n_clusters
+
+        if N <= 0:
+            # 极端兜底，返回全 0
+            return torch.zeros(K, D, device=device, dtype=X.dtype)
+
+        if self.is_sparse:
+            # 第一个中心为零，其余从数据随机抽样
+            centroids = torch.zeros(K, D, device=device, dtype=X.dtype)
+            if K > 1:
+                if N >= K - 1:
+                    idx = torch.randperm(N, device=device)[:(K - 1)]
+                else:
+                    idx = torch.randint(0, N, (K - 1,), device=device)
+                centroids[1:] = X[idx]
+            return centroids
+        else:
+            # 直接从数据中随机抽样 K 个点作为初始质心
+            if N >= K:
+                idx = torch.randperm(N, device=device)[:K]
+            else:
+                # 样本数少于簇数时，允许有放回采样
+                idx = torch.randint(0, N, (K,), device=device)
+            centroids = X[idx].clone()
+            return centroids
+
 
 @torch.no_grad()
 def _squared_euclidean(a: Tensor, b: Tensor) -> Tensor:
@@ -149,7 +209,7 @@ def _squared_euclidean(a: Tensor, b: Tensor) -> Tensor:
     a2 = (a * a).sum(dim=1, keepdim=True)        # (B, 1)
     b2 = (b * b).sum(dim=1, keepdim=True).t()    # (1, K)
     # 使用 GEMM；对大维度通常比 cdist 快且不需要 sqrt
-    ab = a @ b.t()                                # (B, K)
+    ab = a @ b.t()                               # (B, K)
     dist2 = a2 - 2 * ab + b2
     # 数值上可能出现极小负数，截断为非负
     return dist2.clamp_min_(0.0)
