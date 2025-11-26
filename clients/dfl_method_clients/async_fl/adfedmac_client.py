@@ -35,7 +35,6 @@ class ADFedMACClient(Client):
         # { layer_key: Tensor[n_clusters, 1] }
         self.global_cents: Dict[str, torch.Tensor] = {}
 
-    # ------------------------- KMeans 辅助 -------------------------
     @staticmethod
     def _sort_centroids_and_remap(c1d: torch.Tensor, lbl: torch.Tensor):
         c = c1d.view(-1).detach()
@@ -58,14 +57,11 @@ class ADFedMACClient(Client):
                 orig = w.shape
                 flat = w.detach().view(-1, 1)
 
-                # 构建 KMeans 实例
                 kmeans = TorchKMeans(n_clusters=self.n_clusters, is_sparse=True)
 
-                # === NEW: 若有全局码本，则作为 KMeans 初始质心 ===
                 if self.use_global_cents:
                     g = self.global_cents.get(key, None)
                     if g is not None:
-                        # 形状应为 [K, 1] 或兼容
                         if g.dim() == 1:
                             g_init = g.view(-1, 1)
                         else:
@@ -95,7 +91,6 @@ class ADFedMACClient(Client):
 
         self.mask = mask
 
-        # === NEW: 对于还没有全局码本的层，用本地质心初始化 global_cents ===
         if self.use_global_cents:
             for k, c in cents.items():
                 if (k not in self.global_cents) or (self.global_cents[k].shape != c.shape):
