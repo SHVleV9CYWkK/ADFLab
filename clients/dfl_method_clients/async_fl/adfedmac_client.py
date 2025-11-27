@@ -31,7 +31,7 @@ class ADFedMACClient(Client):
         self.apply_mask_every_epoch: bool = bool(hp.get('apply_mask_every_epoch', True))
         self.ps_mass: float = 1.0
 
-        self.use_global_cents: bool = bool(hp.get('use_global_cents', False))
+        self.use_global_cents: bool = bool(hp.get('use_global_cents', True))
         # { layer_key: Tensor[n_clusters, 1] }
         self.global_cents: Dict[str, torch.Tensor] = {}
 
@@ -139,6 +139,46 @@ class ADFedMACClient(Client):
                 loss = self.criterion(outputs, labels).mean()
                 loss.backward()
                 self.optimizer.step()
+
+    def _reconstruct_from_compressed(self, cents: Dict[str, torch.Tensor],
+                                     labels: Dict[str, torch.Tensor],
+                                     uncompressed: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """
+        利用本地模型的结构信息，从 (质心, 索引, 未压缩层) 重构出完整的 state_dict
+        """
+        reconstructed_state = {}
+
+        # 1. 先填入未压缩的层 (如 BN, Bias 等)
+        for k, v in uncompressed.items():
+            reconstructed_state[k] = v.to(self.device)
+
+        # 2. 获取本地模型结构的形状信息
+        local_state = self.model.state_dict()
+
+        # 3. 重构被压缩的层
+        for key, idxs in labels.items():
+            if key not in cents:
+                continue
+
+            # 准备数据，确保在计算设备上
+            c = cents[key].to(self.device)  # shape: [n_clusters, 1]
+            idx = idxs.to(self.device).long()  # shape: [num_params] (必须转为 long 用于索引)
+
+            # 校验：确保该层存在于本地模型中以获取 shape
+            if key in local_state:
+                orig_shape = local_state[key].shape
+            else:
+                # 如果模型结构不匹配（极少见），则跳过或报错
+                continue
+
+            # 核心重构逻辑：查表 (Look-up) -> Reshape
+            # c[idx] 得到 [num_params, 1]，然后 view 回原始形状
+            w_flat = c[idx]
+            w_reconstructed = w_flat.view(orig_shape)
+
+            reconstructed_state[key] = w_reconstructed
+
+        return reconstructed_state
 
     @torch.no_grad()
     def aggregate(self):
@@ -257,7 +297,41 @@ class ADFedMACClient(Client):
         else:
             clustered_state_dict, cents, labels = self.cluster_model
 
+        uncompressed_weights = {}
+        for k, v in clustered_state_dict.items():
+            if k not in cents:
+                uncompressed_weights[k] = v
+
+        payload = {
+            'cents': cents,
+            'labels': labels,
+            'uncompressed': uncompressed_weights
+        }
+
         # 打包成熟度 meta
         meta = self._prepare_maturity_meta()
 
-        return clustered_state_dict, cents, labels, meta
+        return payload, meta
+
+    def receive_neighbor_model(self, neighbor_payload):
+        if isinstance(neighbor_payload, tuple) and len(neighbor_payload) >= 2:
+            compressed_data = neighbor_payload[0]
+            meta = neighbor_payload[-1]
+
+            if isinstance(compressed_data, dict) and 'cents' in compressed_data and 'labels' in compressed_data:
+                nb_cents = compressed_data['cents']
+                nb_labels = compressed_data['labels']
+                nb_uncompressed = compressed_data['uncompressed']
+
+                reconstructed_state_dict = self._reconstruct_from_compressed(
+                    nb_cents, nb_labels, nb_uncompressed
+                )
+
+                new_payload = (reconstructed_state_dict, nb_cents, nb_labels, meta)
+
+            else:
+                new_payload = neighbor_payload
+        else:
+            new_payload = neighbor_payload
+
+        super().receive_neighbor_model(new_payload)

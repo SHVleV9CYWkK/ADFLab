@@ -4,6 +4,7 @@ from typing import Dict, List
 
 from clients.dfl_method_clients.async_fl.adfedmac_client import ADFedMACClient
 from clients.dfl_method_clients.async_fl.async_dfedavg_client import AsyncDFedAvgClient
+from clients.dfl_method_clients.async_fl.divshare_client import DivShareClient
 from clients.dfl_method_clients.async_fl.independent_client import IndependentClient
 from clients.dfl_method_clients.async_fl.swift_client import SWIFTClient
 from clients.dfl_method_clients.sync_fl.dfedavg_client import DFedAvgClient
@@ -68,6 +69,8 @@ def _pick_client_class(fl_type: str):
         return IndependentClient
     if fl_type == "swift":
         return SWIFTClient
+    if fl_type == "divshare":
+        return DivShareClient
     raise NotImplementedError(f'Invalid Federated learning method name: {fl_type}')
 
 
