@@ -72,6 +72,7 @@ class Client(ABC):
         self.samples_seen: int = 0
         self.bytes_sent: int = 0                    # 由协调器按实际收件人数量更新
         self.bytes_recv: int = 0
+        self.is_delayed_client: bool = bool(hyperparam.get('is_delayed', False))
 
         # 训练时钟配置（确定性、可复现）
         # 支持两种模式：'constant' 或 'steps*t_step'（默认）

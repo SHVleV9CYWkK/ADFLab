@@ -51,7 +51,7 @@ def parse_args():
     parser.add_argument('--mode', type=str, default='async', choices=['sync', 'async'],
                         help='Execution mode: synchronous (round-based) or asynchronous (event-driven).')
     parser.add_argument('--fl_method', type=str, default='dfedavg',
-                        choices=['dfedavg', 'dfedcad', 'dfedmtkd', 'dfedmtkdrl', 'dfedpgp', 'dfedsam', 'fedgo', 'qfedcg', 'retfhd', 'async_dfedavg', 'adfedmac', 'independent', 'swift', 'divshare'],
+                        choices=['dfedavg', 'dfedcad', 'dfedmtkd', 'dfedmtkdrl', 'dfedpgp', 'dfedsam', 'fedgo', 'qfedcg', 'retfhd', 'async_dfedavg', 'adfedmac', 'independent', 'swift', 'divshare', 'cadfedfilter'],
                         help='Decentralized FL method (local training + on-receive aggregation policy).')
 
     # ----- Dataset / model / optimizer -----

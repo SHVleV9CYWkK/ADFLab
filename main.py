@@ -254,6 +254,9 @@ def main():
         torch.backends.cudnn.benchmark = False
         torch.cuda.manual_seed_all(args.seed)
         device = torch.device("cuda")
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.set_float32_matmul_precision("high")
     elif args.device == "mps" and torch.backends.mps.is_available():
         device = torch.device("mps:0")
     else:
