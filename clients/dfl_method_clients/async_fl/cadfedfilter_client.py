@@ -2,6 +2,7 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any, Dict, Optional, Tuple
 
+import math
 import torch
 import torch.nn as nn
 
@@ -196,7 +197,7 @@ class CADFedFilterClient(Client):
         self.ps_mass = share
 
         return {
-            'version_meta': 'adfedmac_meta_v3',
+            'version_meta': 'cadfedfilter_meta_v1',
             'sender_id': self.id,
             'version': self.local_version,
             'sender_time': self.last_update_time,
@@ -204,7 +205,7 @@ class CADFedFilterClient(Client):
         }
 
     # ============================================================
-    # 聚合（带 Centroid Drift Filtering）
+    # 聚合（指数衰减软权重版）
     # ============================================================
     @torch.no_grad()
     def aggregate(self):
@@ -226,6 +227,7 @@ class CADFedFilterClient(Client):
             self.model.load_state_dict(avg_state)
             self.cluster_model = self._cluster_and_prune_model_weights()
 
+            # ps_mass 初次累加所有邻居 Quality Mass
             recv_mass = sum(
                 float(tpl[-1]['ps_mass_share'])
                 for tpl in self.neighbor_model_weights_buffer
@@ -238,13 +240,17 @@ class CADFedFilterClient(Client):
 
         # ------------------------ 常规聚合 ------------------------
         neighbor_states = []
-        neighbor_masses_raw = []
+        neighbor_masses = []
         neighbor_cents_list = []
 
         for tpl in self.neighbor_model_weights_buffer:
-            neighbor_states.append(tpl[0])
+            state_dict = tpl[0]
             meta = tpl[-1] if isinstance(tpl[-1], dict) else {}
-            neighbor_masses_raw.append(float(meta.get("ps_mass_share", 0.0)))
+
+            mass_share = float(meta.get("ps_mass_share", 0.0))
+
+            neighbor_states.append(state_dict)
+            neighbor_masses.append(mass_share)
 
             if len(tpl) >= 2 and isinstance(tpl[1], dict):
                 neighbor_cents_list.append(tpl[1])
@@ -254,60 +260,62 @@ class CADFedFilterClient(Client):
         keys = set(neighbor_states[0].keys())
         local_mass = float(self.ps_mass)
 
-        # ----------------------------------------------------------
-        # SAF：过滤语义漂移大的邻居（只过滤模型，不过滤 mass）
-        # ----------------------------------------------------------
-        valid_neighbors = []
-        valid_masses = []
-        valid_cents = []
+        # ==========================================================
+        # SAF-soft：为每个邻居计算 alpha_j = exp(-gamma * drift_j)
+        # 并对模型 & mass 一致加权（不再做 hard drop）
+        # ==========================================================
+        eff_masses = []      # 有效质量 m_eff = alpha_j * m_raw
+        eff_cents = []       # 对应的邻居质心
+        alphas = []          # 仅用于调试
 
-        for st, m_raw, c_nb in zip(neighbor_states, neighbor_masses_raw, neighbor_cents_list):
+        for m_raw, c_nb in zip(neighbor_masses, neighbor_cents_list):
 
-            if self.use_saf and self.use_global_cents and len(self.global_cents) > 0:
+            if (
+                self.use_saf
+                and self.use_global_cents
+                and len(self.global_cents) > 0
+                and c_nb is not None
+                and len(c_nb) > 0
+            ):
                 drift_j = self._compute_neighbor_centroid_drift(c_nb)
 
                 if self.print_drift:
                     print(f"[Client {self.id}] neighbor drift = {drift_j:.6f}")
 
-                if drift_j > self.saf_tau:
-                    # 过滤模型，但 mass 后面仍会加进去
-                    continue
+                # 指数衰减：alpha_j = exp(-gamma * drift_j)
+                alpha_j = math.exp(-self.saf_gamma * drift_j)
+                # 限制在 [saf_min_alpha, 1.0]
+                alpha_j = max(self.saf_min_alpha, min(1.0, alpha_j))
+            else:
+                alpha_j = 1.0
 
-            # 保留该邻居参与模型聚合
-            valid_neighbors.append(st)
-            valid_masses.append(m_raw)
-            valid_cents.append(c_nb)
+            alphas.append(alpha_j)
+            eff_masses.append(alpha_j * m_raw)
+            eff_cents.append(c_nb)
 
-        # ----------------------------------------------------------
-        # Push-sum mass 仍然加入“所有邻居的 mass_raw”
-        # ----------------------------------------------------------
-        total_mass_raw = local_mass + sum(neighbor_masses_raw)
-        self.ps_mass = float(total_mass_raw)
+        # ------------------------ Push-sum 质量更新 ------------------------
+        total_mass = local_mass + sum(eff_masses)
+        if total_mass <= 0:
+            # 极端兜底：退化成仅本地
+            total_mass = local_mass if local_mass > 0 else 1.0
+            eff_masses = [0.0 for _ in eff_masses]
 
-        # 若全部邻居都被过滤，则退化为本地模型
-        if len(valid_neighbors) == 0:
-            self.neighbor_model_weights_buffer.clear()
-            return
+        self.ps_mass = float(total_mass)
 
-        # ----------------------------------------------------------
-        # 模型聚合（只用 valid_neighbors）
-        # ----------------------------------------------------------
-        total_mass_model = local_mass + sum(valid_masses)
-        if total_mass_model <= 0:
-            total_mass_model = local_mass if local_mass > 0 else 1.0
-
+        # ------------------------ 模型聚合（使用软权重后的有效质量） ------------------------
         avg = {}
         local_state = self.model.state_dict()
 
         for k in keys:
             acc = None
 
-            # 邻居贡献
-            for st, m_eff in zip(valid_neighbors, valid_masses):
+            # 邻居贡献：每个邻居质量 m_j → m_eff = alpha_j * m_j
+            for st, m_eff in zip(neighbor_states, eff_masses):
+                if m_eff <= 0.0:
+                    continue
                 if k not in st:
                     continue
                 t = st[k].to(self.device)
-
                 acc = t.mul(m_eff) if acc is None else acc.add(t, alpha=m_eff)
 
             # 本地贡献
@@ -315,13 +323,11 @@ class CADFedFilterClient(Client):
                 t_local = local_state[k].to(self.device)
                 acc = t_local.mul(local_mass) if acc is None else acc.add(t_local, alpha=local_mass)
 
-            avg[k] = acc.div(total_mass_model)
+            avg[k] = acc.div(total_mass)
 
         self.model.load_state_dict(avg)
 
-        # ----------------------------------------------------------
-        # 更新 global_cents（也只用 valid_neighbors）
-        # ----------------------------------------------------------
+        # ------------------------ 更新 global_cents（也用 m_eff） ------------------------
         _, local_cents, _ = self.cluster_model
         new_global_cents = {}
 
@@ -331,7 +337,9 @@ class CADFedFilterClient(Client):
             num = c_local * local_mass
             den = local_mass
 
-            for c_nb, m_eff in zip(valid_cents, valid_masses):
+            for c_nb, m_eff in zip(eff_cents, eff_masses):
+                if m_eff <= 0.0:
+                    continue
                 if key not in c_nb:
                     continue
                 num = num + m_eff * c_nb[key].to(self.device)
@@ -355,10 +363,7 @@ class CADFedFilterClient(Client):
     # ============================================================
     def set_init_model(self, model: nn.Module):
         model = deepcopy(model).to(self.device)
-
-        # 如果是 PyTorch 2.x，可以编译模型
-        model = torch.compile(model)  # 默认 backend="inductor"
-
+        model = torch.compile(model)
         self.model = model
 
     def send_model(self):
