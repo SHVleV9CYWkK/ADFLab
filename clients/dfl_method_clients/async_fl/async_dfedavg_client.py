@@ -16,22 +16,30 @@ class AsyncDFedAvgClient(Client):
         if len(self.neighbor_model_weights_buffer) == 0:
             return  # 没有邻居更新就不动
 
-        neighbor_weights_state = [neighbor[0] for neighbor in self.neighbor_model_weights_buffer]
+        device = self.device
+        neighbor_states = [neighbor[0] for neighbor in self.neighbor_model_weights_buffer]
 
-        # 取当前本地模型（作为被平均的第一项）
-        current = {k: v.detach().clone().to(self.device) for k, v in self.model.state_dict().items()}
-        count = 1 + len(self.neighbor_model_weights_buffer)
+        # 本地 state
+        local_state = self.model.state_dict()
+        count = 1 + len(neighbor_states)
 
-        # 累加邻居
-        for sd in neighbor_weights_state:
-            for k in current.keys():
-                current[k] += sd[k].to(self.device)
+        new_state = {}
 
-        # 做平均并加载回模型
-        for k in current.keys():
-            current[k] /= float(count)
+        for k, v_local in local_state.items():
+            t0 = v_local.to(device)
 
-        self.model.load_state_dict(current)
+            if t0.is_floating_point() or t0.is_complex():
+                acc = t0.clone()
+                for sd in neighbor_states:
+                    acc.add_(sd[k].to(device))
+                acc.div_(float(count))
+                new_state[k] = acc
+
+            else:
+                new_state[k] = t0
+
+        self.model.load_state_dict(new_state)
+        self.neighbor_model_weights_buffer.clear()
 
     # ---- 初始化模型 ----
     def set_init_model(self, model):

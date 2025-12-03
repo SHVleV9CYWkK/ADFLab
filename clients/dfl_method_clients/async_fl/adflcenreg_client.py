@@ -254,7 +254,15 @@ class ADFLCenRegClient(Client):
             avg_state = {}
             for k in keys:
                 tensors = [st[k].to(device) for st in neighbor_states]
-                avg_state[k] = torch.stack(tensors).mean(dim=0)
+                t0 = tensors[0]
+
+                # 浮点/复数：正常求平均
+                if t0.is_floating_point() or t0.is_complex():
+                    avg_state[k] = torch.stack(tensors, dim=0).mean(dim=0)
+
+                # 非浮点（long/int/bool）：直接拿第一个邻居的值（或本地值），不做平均
+                else:
+                    avg_state[k] = t0.clone()
 
             self.model.load_state_dict(avg_state)
             self.cluster_model = self._cluster_and_prune_model_weights()

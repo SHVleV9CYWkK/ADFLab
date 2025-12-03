@@ -145,9 +145,11 @@ class DivShareClient(Client):
         if self.model is None:
             raise RuntimeError("aggregate() 之前必须先设置模型")
 
+        device = self.device
+
         # 本地模型参数（device 上）
         local_state: Dict[str, torch.Tensor] = {
-            k: v.detach().clone().to(self.device)
+            k: v.detach().clone().to(device)
             for k, v in self.model.state_dict().items()
         }
 
@@ -164,11 +166,9 @@ class DivShareClient(Client):
                 continue
             fragments_list, meta = payload
 
-            # 确保是 list[dict]
             if not isinstance(fragments_list, list) or len(fragments_list) == 0:
                 continue
 
-            # 对这个邻居：随机选一个 fragment
             idx = np.random.randint(len(fragments_list))
             chosen_frag = fragments_list[idx]
             if not isinstance(chosen_frag, dict):
@@ -179,20 +179,25 @@ class DivShareClient(Client):
                     continue
                 if k not in neighbor_param_buckets:
                     neighbor_param_buckets[k] = []
-                neighbor_param_buckets[k].append(tensor.to(self.device))
+                neighbor_param_buckets[k].append(tensor.to(device))
 
         # 逐参数聚合
         new_state: Dict[str, torch.Tensor] = {}
         for k, local_tensor in local_state.items():
             if k not in neighbor_param_buckets:
-                # 没有任何邻居给这个参数 -> 保持本地
                 new_state[k] = local_tensor
             else:
                 bucket = neighbor_param_buckets[k]
-                acc = local_tensor.clone()
-                for t in bucket:
-                    acc += t
-                acc /= float(1 + len(bucket))
-                new_state[k] = acc
+                t0 = local_tensor
+
+                if t0.is_floating_point() or t0.is_complex():
+                    acc = t0.clone()
+                    for t in bucket:
+                        acc.add_(t.to(device, dtype=t0.dtype))
+                    acc.div_(float(1 + len(bucket)))
+                    new_state[k] = acc
+                else:
+                    # 非浮点：保留本地值（或改成 bucket[0] 也行）
+                    new_state[k] = t0
 
         self.model.load_state_dict(new_state)
