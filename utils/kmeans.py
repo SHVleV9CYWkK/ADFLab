@@ -1,6 +1,7 @@
 import torch
 from torch import Tensor
 
+
 class TorchKMeans:
     def __init__(self, n_clusters=8, n_init=1, max_iter=300, tol=5e-3,
                  batch_size=None, is_sparse=False, use_minibatch=False,
@@ -35,13 +36,15 @@ class TorchKMeans:
         N, D = X.shape
         K = self.n_clusters
 
-        # 预先计算样本平方范数（后面距离计算复用）
-        X2 = (X * X).sum(dim=1, keepdim=True)  # (N, 1)
+        one_dim = (D == 1)
+
+        # 预先计算样本平方范数（高维时用于距离计算复用）
+        X2 = None if one_dim else (X * X).sum(dim=1, keepdim=True)  # (N,1) 或 None
 
         best_loss = float('inf')
         best_centroids = None
 
-        # 处理外部初始化的质心
+        # -------- 处理外部初始化的质心 --------
         use_custom_init = False
         custom_init = None
         if self.init_centroids is not None:
@@ -55,6 +58,10 @@ class TorchKMeans:
 
         # 使用自定义 init 时只跑一次
         n_init = 1 if use_custom_init else self.n_init
+
+        # -------- 预分配 ones_full，用于 scatter_add --------
+        max_B = self.batch_size or N
+        ones_full = torch.ones(max_B, device=device, dtype=torch.long)
 
         for _ in range(n_init):
             # 初始化质心
@@ -73,27 +80,24 @@ class TorchKMeans:
             # 预分配 per-iter buffer，循环里复用
             sums = torch.empty_like(centroids)  # (K, D)
             counts = torch.empty(K, device=device, dtype=torch.long)  # (K,)
-            ones_batch = None  # 用于 scatter_add
 
             for _ in range(self.max_iter):
                 # 抽 batch / 全量
                 if self.batch_size:
-                    idx = torch.randint(0, N, (self.batch_size,), device=device)
-                    x = X[idx]          # (B, D)
-                    x2 = X2[idx]        # (B, 1)
-                    # 预分配 batch size 对应的 ones
-                    if ones_batch is None or ones_batch.size(0) != x.size(0):
-                        ones_batch = torch.ones(x.size(0), device=device, dtype=torch.long)
+                    B = self.batch_size
+                    idx = torch.randint(0, N, (B,), device=device)
+                    x = X[idx]                      # (B, D)
+                    x2 = None if one_dim else X2[idx]
+                    ones_batch = ones_full[:B]
                 else:
-                    x = X               # (N, D)
-                    x2 = X2             # (N, 1)
-                    if ones_batch is None:
-                        ones_batch = torch.ones(x.size(0), device=device, dtype=torch.long)
+                    x = X                           # (N, D)
+                    x2 = X2
+                    ones_batch = ones_full[:N]
 
-                # 计算到各中心的平方距离 (B, K)，复用 x2
+                # 计算到各中心的平方距离 (B, K)，复用 x2（高维）
                 dist2 = _squared_euclidean(x, centroids, a2=x2)
 
-                # 一次性拿到最小距离和标签，避免 argmin + gather
+                # 一次性拿到最小距离和标签
                 min_dist2, labels = dist2.min(dim=1)  # labels: (B,)
                 loss = min_dist2.sum()
 
@@ -101,7 +105,7 @@ class TorchKMeans:
                 sums.zero_()
                 counts.zero_()
 
-                # 累计到 sums / counts（counts 复用 scatter_add）
+                # 累计到 sums / counts
                 sums.index_add_(0, labels, x)
                 counts.scatter_add_(0, labels, ones_batch)
 
@@ -113,9 +117,10 @@ class TorchKMeans:
                 else:
                     # 空簇重置为随机样本
                     empty = counts == 0
-                    if empty.any():
+                    num_empty = int(empty.sum())
+                    if num_empty > 0:
                         rand_idx = torch.randint(0, x.size(0),
-                                                 (empty.sum().item(),),
+                                                 (num_empty,),
                                                  device=device)
                         sums[empty] = x[rand_idx]
                         counts[empty] = 1
@@ -138,7 +143,7 @@ class TorchKMeans:
                 best_loss = loss
                 best_centroids = centroids
 
-        # 最终全量打标，复用 X2
+        # 最终全量打标（复用 X2 / fast path）
         self.centroids = best_centroids
         all_dist2 = _squared_euclidean(X, self.centroids, a2=X2)
         self.labels_ = torch.argmin(all_dist2, dim=1)
@@ -146,6 +151,9 @@ class TorchKMeans:
 
     @torch.no_grad()
     def _initialize_centroids_kpp(self, X: Tensor, cap: int = 4_194_304):
+        """
+        K-Means++ 初始化，可选使用。
+        """
         N = X.size(0)
         device = X.device
         K = self.n_clusters
@@ -222,7 +230,20 @@ def _squared_euclidean(a: Tensor, b: Tensor,
                        b2: Tensor | None = None) -> Tensor:
     """
     a: (B, D), b: (K, D) -> returns (B, K) squared distances
+    - 对 D=1 的情况做了 fast path，特别适合权重拉平成 (N,1) 的场景
     """
+    B, D = a.shape
+    K, D2 = b.shape
+    assert D == D2
+
+    # ---- 1D fast path：常见于模型权重聚类 ----
+    if D == 1:
+        # a: (B,1), b: (K,1)
+        diff = a - b.t()      # (B, K)
+        dist2 = diff * diff   # (B, K)
+        return dist2.clamp_min_(0.0)
+
+    # ---- 通用高维版本 ----
     if a2 is None:
         a2 = (a * a).sum(dim=1, keepdim=True)  # (B, 1)
     if b2 is None:
