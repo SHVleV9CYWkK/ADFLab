@@ -8,17 +8,8 @@ import torch.nn as nn
 from clients.client import Client
 from utils.kmeans import TorchKMeans
 
-
+# Centroid-Guided Client Filtering for Asynchronous Decentralized Federated Learning (C-ADFedFilter)
 class CADFedFilterClient(Client):
-    """
-    Centroid-Guided Client in Asynchronous Decentralized FL
-
-    核心新点：版本 A — “更新方向与全局趋势的一致性” q_align
-    - 用质心的更新方向 ΔC_i 与 “朝全局质心移动的方向” d_target 的夹角
-    - q_align 越大，说明本轮更新越是“顺着全局趋势走”，质量越高
-    - 在 gossip 聚合时，用 q_align 对邻居的 ps_mass 做 reweight
-    """
-
     def __init__(self, client_id, dataset_index, full_dataset, hyperparam, device):
         hp = dict(hyperparam)
         super().__init__(client_id, dataset_index, full_dataset, hp, device)
@@ -35,28 +26,15 @@ class CADFedFilterClient(Client):
         self.sim_eps: float = 1e-8
         self.apply_mask_every_epoch: bool = bool(hp.get('apply_mask_every_epoch', True))
 
-        # Push-sum mass
         self.ps_mass: float = 1.0
 
-        # 是否使用全局质心做 KMeans 初始化 + 作为“全局趋势”参考
         self.use_global_cents: bool = bool(hp.get('use_global_cents', True))
         self.global_cents: Dict[str, torch.Tensor] = {}
 
-        # ============ 更新方向一致性 q_align ============
-        self.use_align_quality: bool = bool(hp.get("use_align_quality", True))
-        # 对 cos 对齐度的幂次，调节映射形状（>1 更尖锐，=1 线性）
-        self.align_gamma: float = float(hp.get("align_gamma", 1.0))
-        # cos 计算用的 eps
-        self.align_eps: float = float(hp.get("align_eps", 1e-8))
-        # 对齐质量的下界，避免完全灭掉某些邻居
-        self.align_min_score: float = float(hp.get("align_min_score", 0.0))
-
-        # 最近一轮训练得到的对齐质量 q_align \in [0,1]
-        self.align_score: float = 1.0
-        # 存本地质心快照（训练前）
-        self._prev_local_cents: Dict[str, torch.Tensor] = {}
-        # 存对齐目标质心（global snapshot）
-        self._align_target_cents: Dict[str, torch.Tensor] = {}
+        self.use_similarity_weight: bool = bool(hp.get("use_similarity_weight", True))
+        self.alpha_mix: float = float(hp.get("alpha_mix", 0.6))   # 语义占比 α
+        self.beta_dist: float = float(hp.get("beta_dist", 1.0))   # 数值距离温度
+        self.min_alpha: float = float(hp.get("min_alpha", 0.01))  # 最小权重
 
     # ============================================================
     # KMeans 聚类辅助
@@ -72,17 +50,10 @@ class CADFedFilterClient(Client):
         return sorted_c, new_labels
 
     def _cluster_and_prune_model_weights(self):
-        """
-        对当前 self.model 做 KMeans 质心压缩 + 掩码剪枝
-        返回:
-          - clustered: 压缩后权重
-          - cents: {layer: [K,1]}
-          - labels: {layer: [num_params]}
-        """
-        clustered: Dict[str, torch.Tensor] = {}
-        mask: Dict[str, torch.Tensor] = {}
-        cents: Dict[str, torch.Tensor] = {}
-        labels: Dict[str, torch.Tensor] = {}
+        clustered = {}
+        mask = {}
+        cents = {}
+        labels = {}
 
         state = self.model.state_dict()
         for key, w in state.items():
@@ -92,19 +63,18 @@ class CADFedFilterClient(Client):
 
                 kmeans = TorchKMeans(n_clusters=self.n_clusters, is_sparse=True)
 
-                # 如果有全局质心，作为 KMeans 初始
                 if self.use_global_cents:
                     g = self.global_cents.get(key, None)
-                    if g is not None:
-                        g_init = g.view(-1, 1) if g.dim() == 1 else g
-                        if g_init.shape[0] == self.n_clusters:
-                            kmeans.init_centroids = g_init.to(flat.device)
+                    if g is not None and g.shape[0] == self.n_clusters:
+                        kmeans.init_centroids = g.to(flat.device)
 
-                kmeans.fit(flat)
+                optimized_fit = torch.compile(kmeans.fit)
+                optimized_fit(flat)
 
                 cent_sorted, lab_sorted = self._sort_centroids_and_remap(
                     kmeans.centroids.view(-1, 1), kmeans.labels_
                 )
+
                 cent_sorted = cent_sorted.to(self.device)
 
                 new_w = cent_sorted[lab_sorted].view(orig)
@@ -116,13 +86,11 @@ class CADFedFilterClient(Client):
                 cents[key] = cent_sorted
                 labels[key] = lab_sorted.view(-1).to(self.device)
             else:
-                # 非聚类层：原样保留
                 clustered[key] = w.detach().to(self.device)
                 mask[key] = torch.ones_like(w, dtype=torch.bool, device=w.device)
 
         self.mask = mask
 
-        # 若尚未有 global_cents，用本地的形状初始化
         if self.use_global_cents:
             for k, c in cents.items():
                 if (k not in self.global_cents) or (self.global_cents[k].shape != c.shape):
@@ -157,120 +125,22 @@ class CADFedFilterClient(Client):
                 self.optimizer.step()
 
     # ============================================================
-    # 版本 A：对齐快照 & q_align 计算
+    # 重构邻居模型（解码）
     # ============================================================
-    def _capture_align_snapshot(self):
-        """
-        在本轮本地训练开始前调用：
-        - 确保 self.cluster_model 对应当前模型
-        - 保存当前本地质心 C_old
-        - 保存对齐目标质心 G_target（当前 global_cents 的快照）
-        """
-        if self.cluster_model is None:
-            self.cluster_model = self._cluster_and_prune_model_weights()
+    def _reconstruct_from_compressed(self, cents, labels, uncompressed):
+        reconstructed = {}
 
-        _, local_cents, _ = self.cluster_model
-
-        self._prev_local_cents = {
-            k: v.detach().clone().to(self.device) for k, v in local_cents.items()
-        }
-
-        if self.use_global_cents and len(self.global_cents) > 0:
-            self._align_target_cents = {
-                k: v.detach().clone().to(self.device) for k, v in self.global_cents.items()
-            }
-        else:
-            # 没有全局信息时，用自己 C_old 做 target → 对齐分数退化为 1（中性）
-            self._align_target_cents = {
-                k: v.detach().clone().to(self.device) for k, v in local_cents.items()
-            }
-
-    def _update_align_score(self):
-        """
-        在本轮本地训练 + 重新聚类之后调用：
-        - 使用 C_new, C_old, G_target 计算更新方向与目标方向的对齐度 q_align ∈ [0,1]
-        公式：
-            ΔC = C_new - C_old
-            d_target = G_target - C_old
-            cos = max(0, <ΔC, d_target> / (||ΔC||·||d_target||))
-            q_align = max(align_min_score, cos^align_gamma)
-        """
-        if (not self.use_align_quality) or (self.cluster_model is None):
-            self.align_score = 1.0
-            return
-
-        if (len(self._prev_local_cents) == 0) or (len(self._align_target_cents) == 0):
-            self.align_score = 1.0
-            return
-
-        _, local_cents_new, _ = self.cluster_model
-
-        delta_local_list = []
-        delta_target_list = []
-
-        for key, c_prev in self._prev_local_cents.items():
-            if key not in local_cents_new or key not in self._align_target_cents:
-                continue
-
-            c_prev = c_prev.to(self.device)
-            c_new = local_cents_new[key].to(self.device)
-            c_tgt = self._align_target_cents[key].to(self.device)
-
-            if c_prev.shape != c_new.shape or c_prev.shape != c_tgt.shape:
-                continue
-
-            delta_local_list.append((c_new - c_prev).view(-1))
-            delta_target_list.append((c_tgt - c_prev).view(-1))
-
-        if not delta_local_list or not delta_target_list:
-            # 没有可用信息，则保持中性
-            self.align_score = 1.0
-            return
-
-        delta_local = torch.cat(delta_local_list, dim=0)
-        delta_target = torch.cat(delta_target_list, dim=0)
-
-        norm_local = torch.norm(delta_local)
-        norm_target = torch.norm(delta_target)
-        eps = self.align_eps
-
-        if norm_local <= eps or norm_target <= eps:
-            self.align_score = 1.0
-            return
-
-        cos = torch.dot(delta_local, delta_target) / (norm_local * norm_target + eps)
-        cos_clamped = torch.clamp(cos, min=0.0, max=1.0).item()
-
-        gamma = self.align_gamma
-        q = (cos_clamped ** gamma) if gamma != 1.0 else cos_clamped
-        q = max(self.align_min_score, float(q))
-
-        self.align_score = q
-
-    # ============================================================
-    # 模型重构（解码压缩）
-    # ============================================================
-    def _reconstruct_from_compressed(
-        self,
-        cents: Dict[str, torch.Tensor],
-        labels: Dict[str, torch.Tensor],
-        uncompressed: Dict[str, torch.Tensor],
-    ) -> Dict[str, torch.Tensor]:
-        reconstructed: Dict[str, torch.Tensor] = {}
-
-        # 非压缩层先写入
         for k, v in uncompressed.items():
             reconstructed[k] = v.to(self.device)
 
         local_state = self.model.state_dict()
 
-        # 压缩层：质心查表 + reshape
         for key, idx in labels.items():
             if key not in cents:
                 continue
 
-            c = cents[key].to(self.device)          # [K,1]
-            idx = idx.to(self.device).long()        # [num_params]
+            c = cents[key].to(self.device)
+            idx = idx.to(self.device).long()
 
             if key not in local_state:
                 continue
@@ -281,21 +151,10 @@ class CADFedFilterClient(Client):
 
         return reconstructed
 
-    # ============================================================
-    # Push-sum meta 打包（带 q_align）
-    # ============================================================
     def _prepare_maturity_meta(self) -> Dict[str, Any]:
-        """
-        标准 push-sum 质量拆分：
-          - 把当前 ps_mass 均分成 (k_push + 1) 份，一份留给自己，其余发给邻居
-        新增：
-          - 把本轮的对齐质量 q_align 一起打包（不直接缩放 share，而是在接收端使用）
-        """
         d_out = self.k_push + 1
         share = float(self.ps_mass) / float(d_out)
         self.ps_mass = share
-
-        q_align = float(self.align_score) if self.use_align_quality else 1.0
 
         return {
             'version_meta': 'cadfedfilter_meta_v1',
@@ -303,19 +162,55 @@ class CADFedFilterClient(Client):
             'version': self.local_version,
             'sender_time': self.last_update_time,
             "ps_mass_share": share,
-            "q_align": q_align,
         }
 
+    def _histogram_jaccard(self, local_labels_dict, nb_labels_dict):
+        """
+        local_labels_dict, nb_labels_dict: {layer_key: label_vector}
+
+        Return Jaccard similarity between aggregated histograms (0~1).
+        """
+
+        K = self.n_clusters
+        h_local = torch.zeros(K, device=self.device)
+        h_nb = torch.zeros(K, device=self.device)
+
+        # 将所有层的 histogram 聚合
+        for key, lbl in local_labels_dict.items():
+            if key not in nb_labels_dict:
+                continue
+            lbl_local = lbl.to(self.device).long()
+            lbl_nb = nb_labels_dict[key].to(self.device).long()
+
+            h_local += torch.bincount(lbl_local, minlength=K).float()
+            h_nb += torch.bincount(lbl_nb, minlength=K).float()
+
+        # 如果没有重叠层 → 语义信息不足 → 返回 1（中性相似度）
+        if h_local.sum() == 0 or h_nb.sum() == 0:
+            return 1.0
+
+        # 归一化
+        h_local = h_local / (h_local.sum() + 1e-8)
+        h_nb = h_nb / (h_nb.sum() + 1e-8)
+
+        inter = torch.min(h_local, h_nb).sum()
+        union = torch.max(h_local, h_nb).sum() + 1e-8
+
+        return float((inter / union).item())
+
+
     # ============================================================
-    # 聚合：标准 push-sum + 对齐质量 reweight
+    # 聚合
     # ============================================================
     @torch.no_grad()
     def aggregate(self):
-
+        # 无邻居，直接返回
         if len(self.neighbor_model_weights_buffer) == 0:
             return
 
-        # ---------- 首次聚合：还没有 cluster_model ----------
+        # =========================
+        #  首次聚合：还没有 cluster_model
+        # =========================
         if self.cluster_model is None:
             neighbor_states = [tpl[0] for tpl in self.neighbor_model_weights_buffer]
             if len(neighbor_states) == 0:
@@ -332,6 +227,7 @@ class CADFedFilterClient(Client):
             self.model.load_state_dict(avg_state)
             self.cluster_model = self._cluster_and_prune_model_weights()
 
+            # 首次聚合累加所有邻居的 mass
             recv_mass = sum(
                 float(tpl[-1].get("ps_mass_share", 0.0))
                 for tpl in self.neighbor_model_weights_buffer
@@ -342,25 +238,31 @@ class CADFedFilterClient(Client):
             self.neighbor_model_weights_buffer.clear()
             return
 
-        # ---------- 常规聚合 ----------
+        # =========================
+        #  常规聚合：已有 cluster_model
+        # =========================
         neighbor_states = []
-        neighbor_masses_raw = []
+        neighbor_masses = []
         neighbor_cents_list = []
-
-        neighbor_qalign_list = []
+        neighbor_labels_list = []
 
         for tpl in self.neighbor_model_weights_buffer:
+            # 约定：tpl = (state_dict, cents, labels, meta)
             st = tpl[0]
             neighbor_states.append(st)
 
             meta = tpl[-1] if isinstance(tpl[-1], dict) else {}
-            neighbor_masses_raw.append(float(meta.get("ps_mass_share", 0.0)))
-            neighbor_qalign_list.append(float(meta.get("q_align", 1.0)))
+            neighbor_masses.append(float(meta.get("ps_mass_share", 0.0)))
 
             if len(tpl) >= 2 and isinstance(tpl[1], dict):
                 neighbor_cents_list.append(tpl[1])
             else:
                 neighbor_cents_list.append({})
+
+            if len(tpl) >= 3 and isinstance(tpl[2], dict):
+                neighbor_labels_list.append(tpl[2])
+            else:
+                neighbor_labels_list.append({})
 
         if len(neighbor_states) == 0:
             self.neighbor_model_weights_buffer.clear()
@@ -369,40 +271,97 @@ class CADFedFilterClient(Client):
         keys = set(neighbor_states[0].keys())
         local_mass = float(self.ps_mass)
         local_state = self.model.state_dict()
+        local_cents = self.cluster_model[1]  # {layer: [K,1]}
+        local_labels = self.cluster_model[2]  # {layer: [num_params]}
 
-        # ---------- 使用 q_align 对邻居 mass 进行 reweight ----------
-        # 我们希望：相对质量由 q_align 决定，但整体平均 scale 约为 1
-        # α_j = q_align_j / mean(q_align)
-        if self.use_align_quality:
-            scores = [max(0.0, q) for q in neighbor_qalign_list]
-            if all(s <= 0.0 for s in scores):
-                scores = [1.0 for _ in scores]
-
-            mean_score = sum(scores) / (len(scores) + 1e-8)
-            if mean_score <= 0:
-                mean_score = 1.0
-
-            eff_masses = []
-            for m_raw, s in zip(neighbor_masses_raw, scores):
-                alpha_j = s / (mean_score + 1e-8)
-                alpha_j = max(self.align_min_score, float(alpha_j))
-                eff_masses.append(alpha_j * m_raw)
+        # =======================================================
+        #  第一步：为每个邻居算一个“未归一化相似 score_j”
+        #          score_j = (J_j + eps)^alpha_mix * (S_j + eps)^(1-alpha_mix)
+        # =======================================================
+        score_list = []
+        if (not self.use_similarity_weight) or (len(local_cents) == 0) or (len(local_labels) == 0):
+            # 不用相似度加权时，后面统一设 α_j = 1
+            score_list = [1.0 for _ in neighbor_states]
         else:
-            eff_masses = neighbor_masses_raw
+            for c_nb, lbl_nb in zip(neighbor_cents_list, neighbor_labels_list):
 
-        # 若所有邻居有效质量为 0，则退化为本地不聚合
+                # ---------- 数值相似 S_j：质心 L2^2 距离的指数衰减 ----------
+                numeric_diffs = []
+                if isinstance(c_nb, dict) and len(c_nb) > 0:
+                    for key, c_local in local_cents.items():
+                        if key not in c_nb:
+                            continue
+                        c1 = c_local.to(self.device)
+                        c2 = c_nb[key].to(self.device)
+                        if c1.shape != c2.shape:
+                            continue
+                        diff = (c1 - c2).view(-1)
+                        numeric_diffs.append(diff.pow(2).mean())
+
+                if numeric_diffs:
+                    dist_mean = torch.stack(numeric_diffs).mean()
+                    S_j = torch.exp(- self.beta_dist * dist_mean).item()  # in (0,1]
+                else:
+                    # 没有质心信息 → 数值上中性
+                    S_j = 1.0
+
+                # ---------- 语义相似 J_j：Hard-Jaccard on cluster hist ----------
+                if isinstance(lbl_nb, dict) and len(lbl_nb) > 0:
+                    J_j = self._histogram_jaccard(local_labels, lbl_nb)  # in [0,1]
+                else:
+                    # 没有 label 信息 → 语义中性
+                    J_j = 1.0
+
+                # ---------- 混合 score_j ----------
+                score_j = (J_j + self.sim_eps) ** self.alpha_mix * (S_j + self.sim_eps) ** (1.0 - self.alpha_mix)
+                score_list.append(float(score_j))
+
+        # 避免极端情况：全部 score <= 0
+        if all(s <= 0.0 for s in score_list):
+            score_list = [1.0 for _ in score_list]
+
+        # =======================================================
+        #  第二步：归一化成 α_j，使平均 α_j ≈ 1
+        #          α_j = score_j / mean(score)
+        #          → 相似的 >1，不相似的 <1
+        # =======================================================
+        mean_score = sum(score_list) / (len(score_list) + self.sim_eps)
+        if mean_score <= 0:
+            mean_score = 1.0
+
+        eff_masses = []
+        eff_cents = []
+
+        for m_raw, c_nb, score_j in zip(
+                neighbor_masses, neighbor_cents_list, score_list
+        ):
+            if not self.use_similarity_weight:
+                alpha_j = 1.0
+            else:
+                alpha_j = score_j / (mean_score + self.sim_eps)  # 平均约为 1
+
+            m_eff = alpha_j * m_raw
+            eff_masses.append(m_eff)
+            eff_cents.append(c_nb)
+
+        # 若所有邻居有效质量全为 0，退化为本地不聚合
         if sum(eff_masses) == 0.0:
             self.neighbor_model_weights_buffer.clear()
             return
 
-        # ---------- push-sum mass 更新 ----------
+        # =======================================================
+        #  push-sum mass 更新（使用 reweighted mass）
+        # =======================================================
         total_mass = local_mass + sum(eff_masses)
         if total_mass <= 0:
             total_mass = local_mass if local_mass > 0 else 1.0
         self.ps_mass = float(total_mass)
 
-        # ---------- 模型聚合 ----------
+        # =======================================================
+        #  模型聚合：邻居用 m_eff，本地用 local_mass
+        # =======================================================
         avg: Dict[str, torch.Tensor] = {}
+
         for k in keys:
             acc = None
 
@@ -424,107 +383,71 @@ class CADFedFilterClient(Client):
 
         self.model.load_state_dict(avg)
 
-        # ---------- 更新 global_cents（用 reweighted mass） ----------
-        if self.use_global_cents and self.cluster_model is not None:
-            _, local_cents, _ = self.cluster_model
-            new_global_cents: Dict[str, torch.Tensor] = {}
+        # =======================================================
+        #  global_cents 更新：也用 m_eff 做权重
+        # =======================================================
+        new_global_cents: Dict[str, torch.Tensor] = {}
+        for key, c_local in local_cents.items():
+            c_local = c_local.to(self.device)
+            num = c_local * local_mass
+            den = local_mass
 
-            for key, c_local in local_cents.items():
-                c_local = c_local.to(self.device)
-                num = c_local * local_mass
-                den = local_mass
+            for c_nb, m_eff in zip(eff_cents, eff_masses):
+                if m_eff <= 0.0:
+                    continue
+                if key not in c_nb:
+                    continue
+                num = num + m_eff * c_nb[key].to(self.device)
+                den = den + m_eff
 
-                for c_nb, m_eff in zip(neighbor_cents_list, eff_masses):
-                    if m_eff <= 0.0:
-                        continue
-                    if key not in c_nb:
-                        continue
-                    num = num + m_eff * c_nb[key].to(self.device)
-                    den = den + m_eff
+            new_global_cents[key] = num / (den + self.sim_eps)
 
-                new_global_cents[key] = num / (den + self.sim_eps)
-
-            self.global_cents = new_global_cents
-
+        self.global_cents = new_global_cents
         self.neighbor_model_weights_buffer.clear()
 
     # ============================================================
-    # 训练接口：在 train() 里处理对齐快照 + q_align
+    # 训练接口
     # ============================================================
     def train(self):
-        """
-        一轮本地训练：
-          1) 若 cluster_model 为空，先根据当前模型建立初始质心
-          2) 记录 C_old 和 G_target 作为对齐快照
-          3) 本地 SGD 训练
-          4) 重新聚类得到 C_new
-          5) 计算 q_align（更新方向 vs 全局目标方向的一致性）
-        """
-        # 1 + 2: 对齐快照
-        self._capture_align_snapshot()
-
-        # 3: 本地训练
         self._local_train()
-
-        # 4: 用新模型重新聚类
         self.cluster_model = self._cluster_and_prune_model_weights()
 
-        # 5: 计算 q_align
-        self._update_align_score()
-
     # ============================================================
-    # 模型发送 & 接收（压缩 + meta）
+    # 模型发送 & 接收
     # ============================================================
     def set_init_model(self, model: nn.Module):
-        self.model = deepcopy(model).to(self.device)
-        self.cluster_model = None
-        self.ps_mass = 1.0
-        self.global_cents = {}
-        self.align_score = 1.0
-        self._prev_local_cents.clear()
-        self._align_target_cents.clear()
+        model = deepcopy(model).to(self.device)
+        model = torch.compile(model)
+        self.model = model
 
     def send_model(self):
-        """
-        发送压缩模型：
-          payload = {cents, labels, uncompressed}
-          meta    = {ps_mass_share, q_align, ...}
-        """
         if self.cluster_model is None:
             clustered_state_dict, cents, labels = self._cluster_and_prune_model_weights()
             self.cluster_model = (clustered_state_dict, cents, labels)
         else:
             clustered_state_dict, cents, labels = self.cluster_model
 
-        # 未压缩层
         uncompressed = {
             k: v for k, v in clustered_state_dict.items() if k not in cents
         }
 
         payload = {
-            "cents": cents,
-            "labels": labels,
-            "uncompressed": uncompressed,
+            'cents': cents,
+            'labels': labels,
+            'uncompressed': uncompressed,
         }
-
         meta = self._prepare_maturity_meta()
         return payload, meta
 
     def receive_neighbor_model(self, neighbor_payload):
-        """
-        解码压缩模型：
-          原始： (state_dict, meta)
-          压缩： ({"cents","labels","uncompressed"}, meta)
-          解码后统一为： (state_dict, cents, labels, meta)
-        """
         if isinstance(neighbor_payload, tuple) and len(neighbor_payload) >= 2:
             compressed = neighbor_payload[0]
             meta = neighbor_payload[-1]
 
-            if isinstance(compressed, dict) and "cents" in compressed:
-                nb_cents = compressed["cents"]
-                nb_labels = compressed["labels"]
-                nb_uncompressed = compressed["uncompressed"]
+            if isinstance(compressed, dict) and 'cents' in compressed:
+                nb_cents = compressed['cents']
+                nb_labels = compressed['labels']
+                nb_uncompressed = compressed['uncompressed']
 
                 reconstructed = self._reconstruct_from_compressed(
                     nb_cents, nb_labels, nb_uncompressed
