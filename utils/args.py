@@ -51,7 +51,7 @@ def parse_args():
     parser.add_argument('--mode', type=str, default='async', choices=['sync', 'async'],
                         help='Execution mode: synchronous (round-based) or asynchronous (event-driven).')
     parser.add_argument('--fl_method', type=str, default='dfedavg',
-                        choices=['dfedavg', 'dfedcad', 'dfedmtkd', 'dfedmtkdrl', 'dfedpgp', 'dfedsam', 'fedgo', 'qfedcg', 'retfhd', 'async_dfedavg', 'adfedmac', 'independent', 'swift', 'divshare', 'cadfedfilter'],
+                        choices=['dfedavg', 'dfedcad', 'dfedmtkd', 'dfedmtkdrl', 'dfedpgp', 'dfedsam', 'fedgo', 'qfedcg', 'retfhd', 'async_dfedavg', 'adflcenreg', 'independent', 'swift', 'divshare'],
                         help='Decentralized FL method (local training + on-receive aggregation policy).')
 
     # ----- Dataset / model / optimizer -----
@@ -134,6 +134,7 @@ def parse_args():
     parser.add_argument('--lambda_kd', type=float, default=0.1, help='Distillation strength.')
     parser.add_argument('--lambda_alignment', type=float, default=0.01, help='Alignment strength.')
     parser.add_argument('--lambda_feature_kd', type=float, default=0.1, help='Feature distillation strength.')
+    parser.add_argument('--lambda_reg', type=float, default=1e-1, help='Regularization strength.')
     parser.add_argument('--rho', type=float, default=0.05,
                         help='Sharpness-Aware Minimization (DFedSAM) radius.')
 
@@ -155,6 +156,9 @@ def parse_args():
     # Backward-compatible tweak
     if args.fl_method == 'dfedcad' and args.lambda_alignment == 0.0:
         args.fl_method = 'dfedcad_without_alignment'
+
+    if args.fl_method == 'adflcenreg' and args.lambda_reg == 0.0:
+        args.fl_method = 'adflcenreg_without_Regularization'
 
     # Post-processing for async_fl defaults
     if args.k_push is None:

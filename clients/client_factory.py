@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Dict, List
 
-from clients.dfl_method_clients.async_fl.cadfedfilter_client import CADFedFilterClient
+from clients.dfl_method_clients.async_fl.adflcenreg_client import ADFLCenRegClient
 from clients.dfl_method_clients.async_fl.async_dfedavg_client import AsyncDFedAvgClient
 from clients.dfl_method_clients.async_fl.divshare_client import DivShareClient
 from clients.dfl_method_clients.async_fl.independent_client import IndependentClient
@@ -63,8 +63,8 @@ def _pick_client_class(fl_type: str):
         return ReTFHDClient
     if fl_type == "async_dfedavg":
         return AsyncDFedAvgClient
-    if fl_type == "adfedmac" or fl_type == "cadfedfilter":
-        return CADFedFilterClient
+    if "adflcenreg" in fl_type:
+        return ADFLCenRegClient
     if fl_type == "independent":
         return IndependentClient
     if fl_type == "swift":
@@ -83,11 +83,12 @@ def create_client(num_client: int, args, dataset_index, full_dataset, join_table
     train_hyperparam = _base_hyperparams(args)
 
     # method-specific extras
-    if "dfedcad" in args.fl_method or "adfedmac" in args.fl_method:
+    if "dfedcad" in args.fl_method or "adflcenreg" in args.fl_method:
         train_hyperparam['lambda_kd'] = args.lambda_kd
         train_hyperparam['n_clusters'] = args.n_clusters
         train_hyperparam['lambda_alignment'] = args.lambda_alignment
         train_hyperparam['base_decay_rate'] = args.base_decay_rate
+        train_hyperparam['lambda_reg'] = args.lambda_reg
 
     elif args.fl_method == "dfedmtkdrl":
         train_hyperparam['lambda_kd'] = args.lambda_kd
