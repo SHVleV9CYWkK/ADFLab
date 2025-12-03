@@ -40,7 +40,7 @@ class CADFedFilterClient(Client):
         # ========== 全局质心 ==========
         self.use_global_cents: bool = bool(hp.get("use_global_cents", True))
         self.global_cents: Dict[str, torch.Tensor] = {}
-        self.centroid_reg_lambda: float = float(hp.get("centroid_reg_lambda", 1e-1))
+        self.centroid_reg_lambda: float = float(hp.get("centroid_reg_lambda", 0.0))
 
     # ============================================================
     # KMeans 聚类辅助
@@ -239,11 +239,7 @@ class CADFedFilterClient(Client):
                     # 2. 计算 sq = diff^2
                     sq_diffs = torch._foreach_pow(diffs, 2)
                     # 3. 计算每个 Tensor 的 sum，然后 stack 再 sum，或者直接用 foreach_norm
-                    # 注意：foreach_norm 返回的是 norm (sqrt(sum(sq)))，这里我们需要 sum(sq)
-                    # 我们可以先 sum 每个 tensor，然后累加
-
-                    # 这种方式比 python list comprehension + stack 这一套快得多
-                    reg_val = sum([t.sum() for t in sq_diffs])
+                    reg_val = torch.stack([t.mean() for t in sq_diffs]).sum()
 
                     loss += lam * reg_val
 
