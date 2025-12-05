@@ -73,6 +73,7 @@ class Client(ABC):
         self.bytes_sent: int = 0                    # 由协调器按实际收件人数量更新
         self.bytes_recv: int = 0
         self.is_delayed_client: bool = bool(hyperparam.get('is_delayed', False))
+        self.is_replace_same_client_model: bool = bool(hyperparam.get("is_replace_same_client_model", False))
 
         # 训练时钟配置（确定性、可复现）
         # 支持两种模式：'constant' 或 'steps*t_step'（默认）
@@ -180,10 +181,11 @@ class Client(ABC):
     def receive_neighbor_model(self, neighbor_model):
         sender_id = neighbor_model[-1]["sender_id"]
 
-        for idx ,item in enumerate(self.neighbor_model_weights_buffer):
-            if item[-1]["sender_id"] == sender_id:
-                self.neighbor_model_weights_buffer.pop(idx)
-                break
+        if self.is_replace_same_client_model:
+            for idx ,item in enumerate(self.neighbor_model_weights_buffer):
+                if item[-1]["sender_id"] == sender_id:
+                    self.neighbor_model_weights_buffer.pop(idx)
+                    break
 
         self.neighbor_model_weights_buffer.append(neighbor_model)
 
@@ -226,10 +228,10 @@ class Client(ABC):
         self.last_accuracy = accuracy
         return {
             'loss': float(avg_loss),
-            'accuracy': float(accuracy.cpu().item()),
-            'precision': float(precision.cpu().item()),
-            'recall': float(recall.cpu().item()),
-            'f1': float(f1.cpu().item()),
+            'accuracy': float(accuracy.item()),
+            'precision': float(precision.item()),
+            'recall': float(recall.item()),
+            'f1': float(f1.item()),
         }
 
     def update_lr(self):

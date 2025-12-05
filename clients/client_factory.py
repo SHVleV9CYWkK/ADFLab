@@ -37,7 +37,8 @@ def _base_hyperparams(args) -> Dict:
         't_step': getattr(args, 't_step', 0.01),
         'fuse_on_receive': getattr(args, 'fuse_on_receive', True),
         'buffer_limit': getattr(args, 'buffer_limit', 16),
-        'k_push': int(getattr(args, "k_push", 10))
+        'k_push': int(getattr(args, "k_push", 10)),
+        'is_replace_same_client_model': getattr(args, "is_replace_same_client_model", False)
     }
     return hp
 

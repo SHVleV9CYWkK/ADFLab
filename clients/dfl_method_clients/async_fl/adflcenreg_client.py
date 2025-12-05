@@ -19,7 +19,7 @@ class ADFLCenRegClient(Client):
         super().__init__(client_id, dataset_index, full_dataset, hp, device)
 
         self.cluster_model: Optional[
-            Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor], Dict[str, torch.Tensor]]
+            Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]
         ] = None
 
         self.mask: Dict[str, torch.Tensor] = {}
@@ -30,7 +30,6 @@ class ADFLCenRegClient(Client):
         self.epochs: int = int(hp.get("epochs", 1))
         self.sim_eps: float = float(hp.get("sim_eps", 1e-8))
         self.apply_mask_every_epoch: bool = bool(hp.get("apply_mask_every_epoch", True))
-
         self.ps_mass: float = 1.0
         self.use_global_cents: bool = bool(hp.get("use_global_cents", True))
         self.global_cents: Dict[str, torch.Tensor] = {}
@@ -50,7 +49,6 @@ class ADFLCenRegClient(Client):
 
     @torch.no_grad()
     def _cluster_and_prune_model_weights(self):
-        clustered: Dict[str, torch.Tensor] = {}
         mask: Dict[str, torch.Tensor] = {}
         cents: Dict[str, torch.Tensor] = {}
         labels: Dict[str, torch.Tensor] = {}
@@ -91,13 +89,11 @@ class ADFLCenRegClient(Client):
                 else:
                     m = torch.ones_like(w)
 
-                clustered[key] = new_w
                 mask[key] = m
                 cents[key] = cent_sorted
                 labels[key] = lab_sorted
 
             else:
-                clustered[key] = w
                 mask[key] = torch.ones_like(w)
 
         self.mask = mask
@@ -115,7 +111,7 @@ class ADFLCenRegClient(Client):
                 if (k not in self.global_cents) or (self.global_cents[k].shape != c.shape):
                     self.global_cents[k] = c.detach().clone().to(device)
 
-        return clustered, cents, labels
+        return cents, labels
 
     @torch.no_grad()
     def _apply_prune_mask_inplace(self):
@@ -134,7 +130,7 @@ class ADFLCenRegClient(Client):
         ):
             return {}
 
-        _, _, labels = self.cluster_model
+        _, labels = self.cluster_model
         prox_target: Dict[str, torch.Tensor] = {}
         state = self.model.state_dict()
 
@@ -298,7 +294,7 @@ class ADFLCenRegClient(Client):
             avg_state[k] = weighted_sum / total_mass
 
         if self.use_global_cents and self.cluster_model:
-            _, local_cents, _ = self.cluster_model
+            local_cents, _ = self.cluster_model
             new_global_cents = {}
 
             for key, c_local in local_cents.items():
@@ -362,8 +358,9 @@ class ADFLCenRegClient(Client):
         if self.cluster_model is None:
             self.cluster_model = self._cluster_and_prune_model_weights()
 
-        clustered_state_dict, cents, labels = self.cluster_model
-        uncompressed = {k: v for k, v in clustered_state_dict.items() if k not in cents}
+        cents, labels = self.cluster_model
+        state_dict = self.model.state_dict()
+        uncompressed = {k: v for k, v in state_dict.items() if k not in cents}
 
         payload = {
             "cents": cents,

@@ -104,6 +104,8 @@ def parse_args():
                         help='If true, fuse incoming neighbor models immediately on receipt.')
     parser.add_argument('--buffer_limit', type=int, default=16,
                         help='Max buffered neighbor updates when fuse_on_receive is false.')
+    parser.add_argument('--is_replace_same_client_model', type=_str2bool, nargs='?', const=True, default=False,
+                        help='Whether to initiate the same client model replacement')
 
     # ----- Delayed joins (Join only; no Leave) -----
     parser.add_argument('--join_mode', type=str, default='table',
