@@ -221,17 +221,26 @@ class ADFLCenRegClient(Client):
 
     @torch.no_grad()
     def aggregate(self):
+        """
+        Push-sum 聚合 + 质心 global_cents 更新
+        - BN 相关参数（key 中含 "bn"）完全本地化，不参与聚合（FedBN 风格）
+        - 仅对浮点/复数参数做加权平均
+        - 非浮点（long/bool）保持本地，避免 dtype 问题
+        """
         if not self.neighbor_model_weights_buffer:
             return
 
         device = self.device
 
-        neighbor_states = []
-        neighbor_masses = []
-        neighbor_cents = []
+        # --------- 收集邻居的 state / mass / cents ---------
+        neighbor_states: List[Dict[str, torch.Tensor]] = []
+        neighbor_masses: List[float] = []
+        neighbor_cents: List[Dict[str, torch.Tensor]] = []
 
         for tpl in self.neighbor_model_weights_buffer:
-            neighbor_states.append(tpl[0])
+            st = tpl[0]
+            neighbor_states.append(st)
+
             meta = tpl[-1] if isinstance(tpl[-1], dict) else {}
             m = float(meta.get("ps_mass_share", 0.0))
             neighbor_masses.append(m)
@@ -245,57 +254,103 @@ class ADFLCenRegClient(Client):
             self.neighbor_model_weights_buffer.clear()
             return
 
-        if self.cluster_model is None:
-            keys = list(neighbor_states[0].keys())
-            avg_state = {}
-            for k in keys:
-                tensors = [st[k].to(device) for st in neighbor_states]
-                t0 = tensors[0]
+        local_state = self.model.state_dict()
 
-                # 浮点/复数：正常求平均
+        # =====================================================
+        # 1) 首次聚合：还没有 cluster_model，用邻居初始化模型
+        #    BN 参数全部保留本地，不参与初始化平均
+        # =====================================================
+        if self.cluster_model is None:
+            avg_state: Dict[str, torch.Tensor] = {}
+
+            for k, v_local in local_state.items():
+                t_local = v_local.to(device)
+
+                # --- BN 参数全部本地化 ---
+                if "bn" in k:
+                    avg_state[k] = t_local
+                    continue
+
+                # 非 BN：用邻居做简单平均（不包含本地）
+                tensors = [st[k].to(device) for st in neighbor_states if k in st]
+                if not tensors:
+                    avg_state[k] = t_local
+                    continue
+
+                t0 = tensors[0]
                 if t0.is_floating_point() or t0.is_complex():
                     avg_state[k] = torch.stack(tensors, dim=0).mean(dim=0)
-
-                # 非浮点（long/int/bool）：直接拿第一个邻居的值（或本地值），不做平均
                 else:
-                    avg_state[k] = t0.clone()
+                    # 非浮点（long/bool 等）保持本地
+                    avg_state[k] = t_local
 
+            # 更新模型
             self.model.load_state_dict(avg_state)
+            # 初始化质心模型（会同时初始化 mask / global_cents 形状）
             self.cluster_model = self._cluster_and_prune_model_weights()
+            # push-sum 质量累加邻居 mass
             self.ps_mass += sum(neighbor_masses)
+
             self.neighbor_model_weights_buffer.clear()
             return
 
+        # =====================================================
+        # 2) 常规聚合：Push-sum 加权平均（BN 本地化）
+        # =====================================================
         local_mass = float(self.ps_mass)
         masses_tensor = torch.tensor(neighbor_masses, device=device, dtype=torch.float32)
         total_mass = local_mass + masses_tensor.sum().item()
-
         if total_mass <= 1e-9:
             total_mass = 1.0
-
         self.ps_mass = total_mass
 
-        keys = list(neighbor_states[0].keys())
-        avg_state = {}
+        avg_state: Dict[str, torch.Tensor] = {}
 
-        for k in keys:
-            nb_tensors = [st[k].to(device) for st in neighbor_states]
-            if not nb_tensors: continue
+        # 按本地 state 的 key 遍历，保证 BN 也被写回
+        for k, v_local in local_state.items():
+            t_local = v_local.to(device)
 
-            nb_stack = torch.stack(nb_tensors)
-            view_shape = [len(neighbor_masses)] + [1] * (nb_stack.ndim - 1)
-            w_tensor = masses_tensor.view(*view_shape)
+            # ---- BN 全部本地，不参与聚合（FedBN 风格）----
+            if "bn" in k:
+                avg_state[k] = t_local
+                continue
 
-            weighted_sum = (nb_stack * w_tensor).sum(dim=0)
+            # 收集有该参数的邻居及其索引
+            nb_tensors: List[torch.Tensor] = []
+            valid_indices: List[int] = []
+            for i, st in enumerate(neighbor_states):
+                if k in st:
+                    nb_tensors.append(st[k].to(device))
+                    valid_indices.append(i)
 
-            if local_mass > 0:
-                weighted_sum += self.model.state_dict()[k] * local_mass
+            if not nb_tensors:
+                # 没有邻居提供该参数，直接保留本地
+                avg_state[k] = t_local
+                continue
 
-            avg_state[k] = weighted_sum / total_mass
+            # 只对浮点/复数做 push-sum 平均
+            if t_local.is_floating_point() or t_local.is_complex():
+                nb_stack = torch.stack(nb_tensors, dim=0)  # [M, *shape]
+                idx_tensor = torch.tensor(valid_indices, device=device, dtype=torch.long)
+                w_subset = masses_tensor.index_select(0, idx_tensor)  # [M]
+                view_shape = [len(nb_tensors)] + [1] * (nb_stack.ndim - 1)
+                w_view = w_subset.view(*view_shape)  # [M,1,1,...]
 
+                weighted_sum = (nb_stack * w_view).sum(dim=0)
+                if local_mass > 0.0:
+                    weighted_sum = weighted_sum + t_local * local_mass
+
+                avg_state[k] = weighted_sum / total_mass
+            else:
+                # 非浮点：保持本地
+                avg_state[k] = t_local
+
+        # =====================================================
+        # 3) 更新 global_cents（仅卷积/FC 权重参与）
+        # =====================================================
         if self.use_global_cents and self.cluster_model:
             local_cents, _ = self.cluster_model
-            new_global_cents = {}
+            new_global_cents: Dict[str, torch.Tensor] = {}
 
             for key, c_local in local_cents.items():
                 c_local = c_local.to(device)
@@ -305,24 +360,27 @@ class ADFLCenRegClient(Client):
 
                 valid_indices = []
                 valid_cents = []
-
                 for i, nc in enumerate(neighbor_cents):
                     if key in nc:
                         valid_indices.append(i)
                         valid_cents.append(nc[key].to(device))
 
                 if valid_cents:
-                    c_stack = torch.stack(valid_cents)
-                    w_subset = masses_tensor[torch.tensor(valid_indices, device=device)]
-                    w_subset_view = w_subset.view(-1, 1, 1)
+                    c_stack = torch.stack(valid_cents, dim=0)  # [M,K,1]
+                    idx_tensor = torch.tensor(valid_indices, device=device, dtype=torch.long)
+                    w_subset = masses_tensor.index_select(0, idx_tensor)  # [M]
+                    w_view = w_subset.view(-1, 1, 1)  # [M,1,1]
 
-                    num += (c_stack * w_subset_view).sum(dim=0)
-                    den += w_subset.sum()
+                    num = num + (c_stack * w_view).sum(dim=0)
+                    den = den + w_subset.sum()
 
                 new_global_cents[key] = num / (den + self.sim_eps)
 
             self.global_cents = new_global_cents
 
+        # =====================================================
+        # 4) 写回模型 & 清空缓冲
+        # =====================================================
         self.model.load_state_dict(avg_state)
         self.neighbor_model_weights_buffer.clear()
 
