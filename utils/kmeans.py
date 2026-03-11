@@ -3,7 +3,7 @@ from torch import Tensor
 
 
 class TorchKMeans:
-    def __init__(self, n_clusters=8, n_init=1, max_iter=300, tol=5e-3,
+    def __init__(self, n_clusters=8, n_init=1, max_iter=3, tol=5e-2,
                  batch_size=None, is_sparse=False, use_minibatch=False,
                  dtype=None, seed=None, init_centroids: Tensor | None = None):
         self.n_clusters = n_clusters

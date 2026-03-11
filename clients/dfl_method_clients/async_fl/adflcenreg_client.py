@@ -220,6 +220,50 @@ class ADFLCenRegClient(Client):
         return reconstructed
 
     @torch.no_grad()
+    def mask_stats(self) -> Dict[str, float]:
+        """
+        返回全局 & 按层的 mask 统计：
+        - global_density: 全局保留率(1占比)
+        - global_sparsity: 全局稀疏率(0占比)
+        - per_layer_density: 每层保留率
+        - per_layer_sparsity: 每层稀疏率
+        """
+        if not self.mask:
+            return {
+                "global_density": 1.0,
+                "global_sparsity": 0.0,
+            }
+
+        total_ones = 0.0
+        total_elems = 0.0
+
+        per_layer_density = {}
+        per_layer_sparsity = {}
+
+        for name, m in self.mask.items():
+            # m 是 float/bfloat/half 的 0/1 张量（你代码里是 w.dtype）
+            ones = float(m.sum().item())
+            elems = float(m.numel())
+            dens = ones / max(elems, 1.0)
+            spar = 1.0 - dens
+
+            per_layer_density[name] = dens
+            per_layer_sparsity[name] = spar
+
+            total_ones += ones
+            total_elems += elems
+
+        global_density = total_ones / max(total_elems, 1.0)
+        global_sparsity = 1.0 - global_density
+
+        return {
+            "global_density": global_density,
+            "global_sparsity": global_sparsity,
+            "per_layer_density": per_layer_density,
+            "per_layer_sparsity": per_layer_sparsity,
+        }
+
+    @torch.no_grad()
     def aggregate(self):
         """
         Push-sum 聚合 + 质心 global_cents 更新
@@ -402,6 +446,9 @@ class ADFLCenRegClient(Client):
         prox_target = self._build_centroid_prox_target()
         self._local_train(prox_target=prox_target)
         self.cluster_model = self._cluster_and_prune_model_weights()
+
+        stats = self.mask_stats()
+        print("density:", stats["global_density"], "sparsity:", stats["global_sparsity"])
 
     def set_init_model(self, model: nn.Module):
         self.model = deepcopy(model).to(self.device)

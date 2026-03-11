@@ -148,7 +148,7 @@ class AsyncCoordinator:
             # 初始化模型与资源
             self.online[cid] = True
             self.epoch[cid] += 1  # invalidate 既往事件（若有）
-            self.all_clients[cid].set_init_model(deepcopy(self.init_model))
+            self.all_clients[cid].set_init_model(self.init_model)
             self.all_clients[cid].init_client()
 
         # 无预热：直接排程首个 TRAIN_DONE

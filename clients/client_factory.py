@@ -6,6 +6,8 @@ from clients.dfl_method_clients.async_fl.adflcenreg_client import ADFLCenRegClie
 from clients.dfl_method_clients.async_fl.async_dfedavg_client import AsyncDFedAvgClient
 from clients.dfl_method_clients.async_fl.divshare_client import DivShareClient
 from clients.dfl_method_clients.async_fl.independent_client import IndependentClient
+from clients.dfl_method_clients.async_fl.proto_kd_client import ProtoKDClient
+from clients.dfl_method_clients.async_fl.pushsum_client import ADFedPushSumClient
 from clients.dfl_method_clients.async_fl.swift_client import SWIFTClient
 from clients.dfl_method_clients.sync_fl.dfedavg_client import DFedAvgClient
 from clients.dfl_method_clients.sync_fl.dfedcad_client import DFedCADClient
@@ -72,6 +74,10 @@ def _pick_client_class(fl_type: str):
         return SWIFTClient
     if fl_type == "divshare":
         return DivShareClient
+    if fl_type == "pushsum":
+        return ADFedPushSumClient
+    if fl_type == "protokd":
+        return ProtoKDClient
     raise NotImplementedError(f'Invalid Federated learning method name: {fl_type}')
 
 
