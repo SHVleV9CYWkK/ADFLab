@@ -11,6 +11,23 @@ class ProtoKDClient(ADFedPushSumClient):
         self.temperature = hyperparam.get('temperature', 0.1)
         self.proto_weight = hyperparam.get('proto_weight', 0.1)  # 对比损失的权重 lambda
 
+        self.use_entropy_adaptive_proto = True
+
+        # entropy 归一化区间，建议你根据统计表设置
+        self.entropy_min = float(hyperparam.get("entropy_min", 0.8))
+        self.entropy_max = float(hyperparam.get("entropy_max", 2.1))
+
+        # 两个控制系数：自己高熵时增加多少；邻居高熵时增加多少
+        self.alpha_self_entropy = float(hyperparam.get("alpha_self_entropy", 0.5))
+        self.alpha_neighbor_entropy = float(hyperparam.get("alpha_neighbor_entropy", 0.5))
+
+        # 蒸馏强度的上下界，防止过大/过小
+        self.proto_weight_min = float(hyperparam.get("proto_weight_min", 0.0))
+        self.proto_weight_max = float(hyperparam.get("proto_weight_max", 3.0))
+
+        # 当前轮邻居平均 entropy
+        self._neighbor_entropy_mean: Optional[float] = None
+
         # 存储特征空间的原型
         self.local_prototypes: Dict[int, torch.Tensor] = {}
         self.global_prototypes: Dict[int, torch.Tensor] = {}
@@ -23,6 +40,34 @@ class ProtoKDClient(ADFedPushSumClient):
         self._class_to_idx: Dict[int, int] = {}
         self._proto_matrix: Optional[torch.Tensor] = None
 
+        self.label_entropy = self.dominant_class_ratio = 0.0
+        self.num_local_samples = self.train_dataset_len
+        self.num_local_classes = self.num_classes
+
+    def _normalize_entropy(self, entropy_value: Optional[float]) -> float:
+        if entropy_value is None:
+            return 0.0
+        denom = max(self.entropy_max - self.entropy_min, 1e-12)
+        x = (float(entropy_value) - self.entropy_min) / denom
+        x = max(0.0, min(1.0, x))
+        return x
+
+    def _get_adaptive_proto_weight(self) -> float:
+        """
+        根据 自身 entropy + 邻居平均 entropy 动态计算蒸馏强度
+        """
+        if not self.use_entropy_adaptive_proto:
+            return self.proto_weight
+
+        self_entropy_norm = self._normalize_entropy(self.label_entropy)
+        neighbor_entropy_norm = self._normalize_entropy(self._neighbor_entropy_mean)
+
+        self_factor = 1.0 + self.alpha_self_entropy * self_entropy_norm
+        neighbor_factor = 1.0 + self.alpha_neighbor_entropy * neighbor_entropy_norm
+
+        adaptive_weight = self.proto_weight * self_factor * neighbor_factor
+        adaptive_weight = max(self.proto_weight_min, min(self.proto_weight_max, adaptive_weight))
+        return float(adaptive_weight)
 
     # ---- 对比损失计算 ----
     def _compute_contrastive_loss(self, features, labels):
@@ -58,11 +103,16 @@ class ProtoKDClient(ADFedPushSumClient):
     @torch.no_grad()
     def _aggregate_neighbor_prototypes(self):
         class_proto_list = {}
+        neighbor_entropies = []
 
         for state, meta in self.neighbor_model_weights_buffer:
             neighbor_protos = meta.get("prototypes", None)
             if not neighbor_protos:
                 continue
+
+            neighbor_entropy = meta.get("label_entropy", None)
+            if neighbor_entropy is not None:
+                neighbor_entropies.append(float(neighbor_entropy))
 
             for label, proto in neighbor_protos.items():
                 label = int(label)
@@ -81,6 +131,10 @@ class ProtoKDClient(ADFedPushSumClient):
         self.global_prototypes = new_global_prototypes
         self._refresh_proto_cache()
 
+        if len(neighbor_entropies) > 0:
+            self._neighbor_entropy_mean = float(sum(neighbor_entropies) / len(neighbor_entropies))
+        else:
+            self._neighbor_entropy_mean = None
 
     def _register_feature_hook(self):
         """
@@ -111,6 +165,35 @@ class ProtoKDClient(ADFedPushSumClient):
         super().set_init_model(model)
         self._register_feature_hook()
 
+    def init_client(self):
+        super().init_client()
+
+        label_count = {}
+        total = 0
+
+        for _, labels in self.client_train_loader:
+            labels = labels.detach().cpu()
+
+            for y in labels:
+                y = int(y.item())
+                label_count[y] = label_count.get(y, 0) + 1
+                total += 1
+
+        if total <= 0:
+            return
+
+        entropy = 0.0
+        max_count = 0
+        for cnt in label_count.values():
+            p = cnt / total
+            entropy -= p * torch.log(torch.tensor(p, dtype=torch.float32)).item()
+            max_count = max(max_count, cnt)
+
+        self.label_entropy = float(entropy)
+        self.num_local_samples = int(total)
+        self.num_local_classes = int(len(label_count))
+        self.dominant_class_ratio = float(max_count / total)
+
     # ---- 覆盖通信逻辑 ----
     def send_model(self):
         """在发送载荷中加入本地原型"""
@@ -118,6 +201,7 @@ class ProtoKDClient(ADFedPushSumClient):
         # 这里假设 self.train_loader 是你类里的本地数据加载器
         # 如果不是，请替换为实际获取本地数据的变量
         meta["prototypes"] = self.local_prototypes
+        meta["label_entropy"] = self.label_entropy
         return state, meta
 
     @torch.no_grad()
@@ -152,9 +236,9 @@ class ProtoKDClient(ADFedPushSumClient):
                 # 2. 如果是延迟节点，且已经收到了全局原型，则叠加对比损失
                 # if self.is_delayed_client and len(self.global_prototypes) > 0:
                 if len(self.global_prototypes) > 0:
-                    # 此时 self._current_features 已经被 hook 捕获
                     loss_proto = self._compute_contrastive_loss(self._current_features, labels)
-                    loss += self.proto_weight * loss_proto
+                    adaptive_proto_weight = self._get_adaptive_proto_weight()
+                    loss += adaptive_proto_weight * loss_proto
 
                 loss.backward()
                 self.optimizer.step()
